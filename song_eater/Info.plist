@@ -1,0 +1,15 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN"
+  "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+    <key>CFBundleIdentifier</key>
+    <string>com.song-eater.audio-tap</string>
+    <key>CFBundleName</key>
+    <string>song-eater</string>
+    <key>NSScreenCaptureUsageDescription</key>
+    <string>song-eater needs to capture audio from applications to record music.</string>
+    <key>NSMicrophoneUsageDescription</key>
+    <string>song-eater needs microphone access to record audio.</string>
+</dict>
+</plist>

@@ -19,3 +19,6 @@ dependencies = [
 
 [project.scripts]
 song-eater = "song_eater.cli:main"
+
+[tool.setuptools.package-data]
+song_eater = ["audio_tap", "audio_tap.swift"]

@@ -6,3 +6,4 @@ build/
 .venv/
 *.mp3
 *.wav
+song_eater/audio_tap
