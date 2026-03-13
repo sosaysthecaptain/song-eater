@@ -58,16 +58,12 @@ class AudioCapturer: NSObject, SCStreamOutput, SCStreamDelegate {
                 }
                 exit(1)
             }
-            for app in matchingApps {
-                log("Capturing: \(app.applicationName) (\(app.bundleIdentifier))")
-            }
             // Include only the matching apps' audio
             filter = SCContentFilter(display: content.displays[0],
                                      including: matchingApps,
                                      exceptingWindows: [])
         } else {
             // System-wide capture
-            log("Capturing all system audio")
             filter = SCContentFilter(display: content.displays[0],
                                      excludingWindows: [])
         }
@@ -75,20 +71,17 @@ class AudioCapturer: NSObject, SCStreamOutput, SCStreamDelegate {
         stream = SCStream(filter: filter, configuration: config, delegate: self)
         try stream!.addStreamOutput(self, type: .audio, sampleHandlerQueue: .global(qos: .userInteractive))
         try await stream!.startCapture()
-        log("Capture started")
     }
 
     func stream(_ stream: SCStream, didOutputSampleBuffer sampleBuffer: CMSampleBuffer, of type: SCStreamOutputType) {
         guard type == .audio else { return }
 
-        // Report format once
+        // Report format once (machine-readable lines for Python to parse)
         if !reportedFormat, let fmt = CMSampleBufferGetFormatDescription(sampleBuffer) {
             let asbd = CMAudioFormatDescriptionGetStreamBasicDescription(fmt)?.pointee
             if let asbd = asbd {
                 fputs("[audio_tap] SAMPLE_RATE=\(Int(asbd.mSampleRate))\n", stderr)
                 fputs("[audio_tap] CHANNELS=\(asbd.mChannelsPerFrame)\n", stderr)
-                log("Format: \(Int(asbd.mSampleRate))Hz, \(asbd.mChannelsPerFrame)ch, \(asbd.mBitsPerChannel)bit")
-                log("Flags: \(String(asbd.mFormatFlags, radix: 16))")
             }
             reportedFormat = true
         }
@@ -107,17 +100,7 @@ class AudioCapturer: NSObject, SCStreamOutput, SCStreamDelegate {
         let channels = 2
         let framesInBuffer = totalFloats / channels
 
-        // Track max amplitude
         sampleCount += framesInBuffer
-        for i in 0..<min(framesInBuffer, 1000) {
-            let v = abs(floatPtr[i])
-            if v > maxAmplitude { maxAmplitude = v }
-        }
-
-        // Log periodically
-        if sampleCount % 48000 < framesInBuffer {
-            log("Streaming: \(sampleCount / 48000)s, peak=\(String(format: "%.4f", maxAmplitude))")
-        }
 
         // SCK delivers non-interleaved: [L0..Ln, R0..Rn]
         // Interleave to [L0, R0, L1, R1, ...] for stdout

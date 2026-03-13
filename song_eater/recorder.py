@@ -68,8 +68,8 @@ def _read_chunks_from_process_tap(
             elif line.startswith("[audio_tap] CHANNELS="):
                 tap_channels[0] = int(line.split("=", 1)[1])
                 ready_event.set()
-            sys.stderr.write(line + "\n")
-            sys.stderr.flush()
+            # Swallow audio_tap debug output — don't pollute the TUI
+            pass
 
     stderr_thread = threading.Thread(target=_drain_stderr, daemon=True)
     stderr_thread.start()

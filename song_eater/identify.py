@@ -1,9 +1,42 @@
-"""Song identification via Shazam fingerprinting."""
+"""Song identification: macOS Now Playing (primary) + Shazam (fallback)."""
+
+from __future__ import annotations
+
+import asyncio
+import tempfile
+from pathlib import Path
 
 from shazamio import Shazam
 
+from song_eater import nowplaying
 
-async def _recognize(wav_path: str) -> dict:
+
+# ---------------------------------------------------------------------------
+# Now Playing (primary — instant, free, 100% accurate)
+# ---------------------------------------------------------------------------
+
+def identify_from_now_playing() -> dict | None:
+    """Read current track metadata from macOS Now Playing.
+
+    Returns a metadata dict or None if nothing is playing / unavailable.
+    """
+    info = nowplaying.get_now_playing()
+    if info is None:
+        return None
+    return {
+        "title": info["title"],
+        "artist": info["artist"],
+        "album": info["album"],
+        "cover_url": None,
+    }
+
+
+# ---------------------------------------------------------------------------
+# Shazam (fallback)
+# ---------------------------------------------------------------------------
+
+async def _shazam_recognize(wav_path: str) -> dict:
+    """Single Shazam recognition attempt."""
     shazam = Shazam()
     result = await shazam.recognize(wav_path)
 
@@ -24,12 +57,14 @@ async def _recognize(wav_path: str) -> dict:
     }
 
 
-def recognize(wav_path: str) -> dict:
-    """Identify a song from a WAV file. Returns metadata dict."""
-    import asyncio
+def shazam_recognize(wav_path: str) -> dict:
+    """Identify a song from a WAV file via Shazam. Returns metadata dict."""
+    return asyncio.run(_shazam_recognize(wav_path))
 
-    return asyncio.run(_recognize(wav_path))
 
+# ---------------------------------------------------------------------------
+# Helpers
+# ---------------------------------------------------------------------------
 
 def _extract_album(track: dict) -> str:
     for section in track.get("sections", []):
