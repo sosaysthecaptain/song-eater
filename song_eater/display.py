@@ -46,7 +46,7 @@ class TUIState:
     expected_duration: float = 0.0   # seconds, from Now Playing
 
     completed: list[CompletedTrack] = field(default_factory=list)
-    skipped: int = 0                 # count of discarded partials
+    skipped: list[str] = field(default_factory=list)  # short descriptions of rejected tracks
     error: str | None = None
 
     # -- Scroll --
@@ -101,6 +101,23 @@ def _fmt_time(secs: float) -> str:
     return f"{m:02d}:{s:02d}"
 
 
+_BAR_WIDTH = 30
+
+
+def _progress_bar(fraction: float) -> Text:
+    """Chunky progress bar."""
+    fraction = max(0.0, min(1.0, fraction))
+    filled = int(fraction * _BAR_WIDTH)
+    empty = _BAR_WIDTH - filled
+    pct = int(fraction * 100)
+
+    bar = Text()
+    bar.append("  " + "█" * filled, style="bold cyan")
+    bar.append("░" * empty, style="dim")
+    bar.append(f"  {pct:3d}%", style="bold white")
+    return bar
+
+
 def _status_line(state: TUIState) -> Text:
     if state.phase == "waiting":
         return Text("  Waiting for audio…", style="dim italic")
@@ -110,6 +127,9 @@ def _status_line(state: TUIState) -> Text:
         if state.expected_duration > 0:
             time_str += f" / {_fmt_time(state.expected_duration)}"
         txt = Text(f"  ● Recording track {state.current_track}  [{time_str}]", style="bold yellow")
+        if state.expected_duration > 0:
+            txt.append("\n")
+            txt.append_text(_progress_bar(elapsed / state.expected_duration))
         return txt
     if state.phase == "identifying":
         return Text(f"  ◌ Identifying track {state.current_track}…", style="bold magenta")
@@ -177,10 +197,14 @@ def build_renderable(state: TUIState, console: Console | None = None):
     # blank + meter + status + optional early_id + optional error + blank +
     # tracks panel border (2) + tracks header row (1) + footer
     chrome = 2 + 2 + 1 + 1 + 1 + 1 + 1 + 1 + 2 + 1 + 1
+    if state.phase == "recording" and state.expected_duration > 0:
+        chrome += 1  # progress bar line
     if state.early_id_result:
         chrome += 1
     if state.error:
         chrome += 1
+    if state.skipped:
+        chrome += min(3, len(state.skipped)) + (1 if len(state.skipped) > 3 else 0)
     # Scroll indicator rows
     total = len(state.completed)
     scroll_indicators = 0
@@ -241,10 +265,20 @@ def build_renderable(state: TUIState, console: Console | None = None):
         padding=(0, 1),
     ))
 
+    # Skipped tracks (show last 3 max to save space)
+    if state.skipped:
+        skip_text = Text()
+        visible_skips = state.skipped[-3:]
+        for s in visible_skips:
+            skip_text.append(f"  ✗ {s}\n", style="dim red")
+        if len(state.skipped) > 3:
+            skip_text.append(f"    … and {len(state.skipped) - 3} more\n", style="dim")
+        parts.append(skip_text)
+
     # Footer
-    skipped_str = f"  │  {state.skipped} skipped" if state.skipped else ""
+    skipped_count = f"  │  {len(state.skipped)} skipped" if state.skipped else ""
     scroll_hint = "  ↑↓ scroll  │" if total > state.VISIBLE_ROWS else ""
-    footer = Text(f" {scroll_hint}  Ctrl+C quit{skipped_str}", style="dim")
+    footer = Text(f" {scroll_hint}  Ctrl+C quit{skipped_count}", style="dim")
 
     parts.append(footer)
 

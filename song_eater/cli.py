@@ -240,6 +240,7 @@ def main(process, device, output, artist, album, threshold, silence_duration, sa
     # Now Playing state: poll when recording starts, cache result
     np_metadata: dict | None = None
     np_last_poll: float = 0.0
+    np_current_title: str | None = None  # detect song changes
     NP_POLL_INTERVAL = 1.0      # re-poll every 1s during recording
     SHAZAM_DELAY = 15           # seconds before Shazam fallback
 
@@ -256,10 +257,11 @@ def main(process, device, output, artist, album, threshold, silence_duration, sa
     # Process a completed track
     # ------------------------------------------------------------------
     def _reset_track_state() -> None:
-        nonlocal shazam_id, shazam_id_sent, np_metadata
+        nonlocal shazam_id, shazam_id_sent, np_metadata, np_current_title
         shazam_id = None
         shazam_id_sent = False
         np_metadata = None
+        np_current_title = None
         state.early_id_result = None
         state.expected_duration = 0.0
         state.phase = "waiting"
@@ -325,21 +327,19 @@ def main(process, device, output, artist, album, threshold, silence_duration, sa
             # We know the expected length — reject if <80%
             if recorded_secs < expected_dur * 0.80:
                 pct = int(recorded_secs / expected_dur * 100)
-                state.error = (
-                    f"Discarded partial: {metadata.get('artist', '?')} – "
-                    f"{metadata.get('title', '?')} "
-                    f"({_fmt_dur(recorded_secs)} / {_fmt_dur(expected_dur)}, {pct}%)"
-                )
-                state.skipped += 1
+                artist = metadata.get('artist', '?')
+                title = metadata.get('title', '?')
+                desc = f"{artist} – {title} ({_fmt_dur(recorded_secs)}/{_fmt_dur(expected_dur)}, {pct}%)"
+                state.error = f"Discarded partial: {desc}"
+                state.skipped.append(desc)
                 _reset_track_state()
                 return
         elif not manual_mode and recorded_secs < MIN_TRACK_SECONDS:
             # No duration info — use minimum length heuristic
-            state.error = (
-                f"Discarded short recording: {metadata.get('title', '?')} "
-                f"({_fmt_dur(recorded_secs)} — under {MIN_TRACK_SECONDS}s minimum)"
-            )
-            state.skipped += 1
+            title = metadata.get('title', '?')
+            desc = f"{title} ({_fmt_dur(recorded_secs)} — under {MIN_TRACK_SECONDS}s)"
+            state.error = f"Discarded short: {desc}"
+            state.skipped.append(desc)
             _reset_track_state()
             return
 
@@ -387,10 +387,7 @@ def main(process, device, output, artist, album, threshold, silence_duration, sa
 
                 # TCC warning
                 if not tcc_warned and chunk_count > (3 * sample_rate // 1024) and max_rms_seen == 0.0:
-                    state.error = (
-                        "No audio detected. Grant 'Screen & System Audio Recording' "
-                        "permission in System Settings > Privacy & Security, then restart."
-                    )
+                    state.error = "No sound yet"
                     tcc_warned = True
 
                 # Handle keyboard
@@ -418,6 +415,26 @@ def main(process, device, output, artist, album, threshold, silence_duration, sa
                             np_last_poll = now
                             np_result = nowplaying.get_now_playing()
                             if np_result and np_result.get("title"):
+                                new_title = np_result.get("title")
+
+                                # Song changed — force-split the current track
+                                if np_current_title and new_title != np_current_title:
+                                    flushed = chunk_reader.flush()
+                                    if flushed is not None and len(flushed) > sample_rate:
+                                        process_track(flushed)
+                                        live.update(display.build_renderable(state, live.console))
+                                    # Start fresh for the new song
+                                    track_num += 1
+                                    state.phase = "recording"
+                                    state.current_track = track_num
+                                    state.record_start = now
+                                    state.early_id_result = None
+                                    state.expected_duration = 0.0
+                                    state.error = None
+                                    shazam_id = None
+                                    shazam_id_sent = False
+
+                                np_current_title = new_title
                                 np_metadata = np_result
                                 dur = np_result.get("duration", 0)
                                 state.expected_duration = dur if dur else 0.0
