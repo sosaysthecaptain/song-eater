@@ -27,6 +27,8 @@ class CompletedTrack:
     artist: str
     title: str
     filename: str
+    discarded: bool = False
+    discard_reason: str = ""
 
 
 @dataclass
@@ -46,11 +48,11 @@ class TUIState:
     expected_duration: float = 0.0   # seconds, from Now Playing
 
     completed: list[CompletedTrack] = field(default_factory=list)
-    skipped: list[str] = field(default_factory=list)  # short descriptions of rejected tracks
     error: str | None = None
 
     # -- Scroll --
     scroll_offset: int = 0
+    scroll_pinned: bool = True    # True = auto-scroll to bottom
 
     VISIBLE_ROWS: int = 10
 
@@ -59,14 +61,13 @@ class TUIState:
 # VU meter (dB-scaled)
 # ---------------------------------------------------------------------------
 
-_VU_WIDTH = 40
 _VU_CHARS = "█"
 _VU_BG = "░"
 _DB_FLOOR = -50.0
 _DB_CEIL = 0.0
 
 
-def _vu_bar(rms: float) -> Text:
+def _vu_bar(rms: float, width: int = 40) -> Text:
     """Return a dB-scaled VU bar for raw *rms* value."""
     if rms <= 0:
         db = _DB_FLOOR
@@ -74,12 +75,12 @@ def _vu_bar(rms: float) -> Text:
         db = max(_DB_FLOOR, min(_DB_CEIL, 20.0 * math.log10(rms)))
 
     fraction = (db - _DB_FLOOR) / (_DB_CEIL - _DB_FLOOR)
-    filled = int(fraction * _VU_WIDTH)
-    empty = _VU_WIDTH - filled
+    filled = int(fraction * width)
+    empty = width - filled
 
     bar = Text()
-    green_end = int(_VU_WIDTH * 0.6)
-    yellow_end = int(_VU_WIDTH * 0.8)
+    green_end = int(width * 0.6)
+    yellow_end = int(width * 0.8)
     for i in range(filled):
         if i < green_end:
             bar.append(_VU_CHARS, style="green")
@@ -101,24 +102,24 @@ def _fmt_time(secs: float) -> str:
     return f"{m:02d}:{s:02d}"
 
 
-_BAR_WIDTH = 30
-
-
-def _progress_bar(fraction: float) -> Text:
+def _progress_bar(fraction: float, width: int = 40) -> Text:
     """Chunky progress bar."""
     fraction = max(0.0, min(1.0, fraction))
-    filled = int(fraction * _BAR_WIDTH)
-    empty = _BAR_WIDTH - filled
+    filled = int(fraction * width)
+    empty = width - filled
     pct = int(fraction * 100)
 
     bar = Text()
-    bar.append("  " + "█" * filled, style="bold cyan")
+    bar.append("█" * filled, style="bold cyan")
     bar.append("░" * empty, style="dim")
     bar.append(f"  {pct:3d}%", style="bold white")
     return bar
 
 
-def _status_line(state: TUIState) -> Text:
+_LABEL_WIDTH = 10  # "  Level  " / "  Track  " — consistent left margin for bars
+
+
+def _status_line(state: TUIState, bar_width: int = 40) -> Text:
     if state.phase == "waiting":
         return Text("  Waiting for audio…", style="dim italic")
     if state.phase == "recording":
@@ -129,7 +130,9 @@ def _status_line(state: TUIState) -> Text:
         txt = Text(f"  ● Recording track {state.current_track}  [{time_str}]", style="bold yellow")
         if state.expected_duration > 0:
             txt.append("\n")
-            txt.append_text(_progress_bar(elapsed / state.expected_duration))
+            label = "  Track".ljust(_LABEL_WIDTH)
+            txt.append(label, style="dim")
+            txt.append_text(_progress_bar(elapsed / state.expected_duration, bar_width))
         return txt
     if state.phase == "identifying":
         return Text(f"  ◌ Identifying track {state.current_track}…", style="bold magenta")
@@ -157,13 +160,15 @@ def _track_table(state: TUIState) -> Table | Text:
     tbl.add_column("#", width=4, justify="right")
     tbl.add_column("Artist", ratio=2, no_wrap=True)
     tbl.add_column("Title", ratio=3, no_wrap=True)
-    tbl.add_column("File", ratio=2, style="dim", no_wrap=True)
+    tbl.add_column("File", ratio=3, style="dim", no_wrap=True)
 
     total = len(state.completed)
     vis = state.VISIBLE_ROWS
 
     if total <= vis:
         state.scroll_offset = 0
+    elif state.scroll_pinned:
+        state.scroll_offset = total - vis
     else:
         state.scroll_offset = max(0, min(state.scroll_offset, total - vis))
 
@@ -175,7 +180,16 @@ def _track_table(state: TUIState) -> Table | Text:
 
     for idx in range(start, end):
         t = state.completed[idx]
-        tbl.add_row(str(t.number), t.artist, t.title, t.filename)
+        if t.discarded:
+            style = "dim strike"
+            tbl.add_row(
+                Text(str(t.number), style=style),
+                Text(t.artist, style=style),
+                Text(t.title, style=style),
+                Text(t.discard_reason, style="dim red"),
+            )
+        else:
+            tbl.add_row(str(t.number), t.artist, t.title, t.filename)
 
     remaining = total - end
     if remaining > 0:
@@ -194,17 +208,11 @@ def build_renderable(state: TUIState, console: Console | None = None):
     # Dynamically size the track table to fill the terminal
     term_height = (console.height if console else 0) or 24
     # Fixed chrome: outer panel border (2) + padding (2) + header + info +
-    # blank + meter + status + optional early_id + optional error + blank +
+    # blank + meter + blank + status + blank + song_line + error_line + blank +
     # tracks panel border (2) + tracks header row (1) + footer
-    chrome = 2 + 2 + 1 + 1 + 1 + 1 + 1 + 1 + 2 + 1 + 1
+    chrome = 2 + 2 + 1 + 1 + 1 + 1 + 1 + 1 + 1 + 1 + 1 + 1 + 2 + 1 + 1
     if state.phase == "recording" and state.expected_duration > 0:
         chrome += 1  # progress bar line
-    if state.early_id_result:
-        chrome += 1
-    if state.error:
-        chrome += 1
-    if state.skipped:
-        chrome += min(3, len(state.skipped)) + (1 if len(state.skipped) > 3 else 0)
     # Scroll indicator rows
     total = len(state.completed)
     scroll_indicators = 0
@@ -230,32 +238,40 @@ def build_renderable(state: TUIState, console: Console | None = None):
     info.append(" as ", style="dim")
     info.append("192k MP3", style="white")
 
-    meter = Text()
-    meter.append("  Level ", style="dim")
-    meter.append_text(_vu_bar(state.rms_level))
+    # Compute bar width from terminal width
+    # outer border (2) + padding (4) + label (10) + suffix (~10) = 26 chars overhead
+    term_width = (console.width if console else 0) or 80
+    bar_width = max(20, term_width - 26)
 
-    status = _status_line(state)
+    meter = Text()
+    label = "  Level".ljust(_LABEL_WIDTH)
+    meter.append(label, style="dim")
+    meter.append_text(_vu_bar(state.rms_level, bar_width))
+
+    status = _status_line(state, bar_width)
+
+    # Song name / error (always reserve the line so layout doesn't shift)
+    song_line = Text()
+    if state.early_id_result:
+        song_line.append("  ♫ ", style="green")
+        song_line.append(state.early_id_result, style="bold white")
+
+    error_line = Text()
+    if state.error:
+        error_line.append(f"  ✗ {state.error}", style="bold red")
 
     parts: list[Text | Panel | Table] = [
         header,
         info,
         Text(""),
         meter,
+        Text(""),
         status,
+        Text(""),
+        song_line,
+        error_line,
+        Text(""),
     ]
-
-    if state.early_id_result:
-        eid = Text()
-        eid.append("  ♫ ", style="green")
-        eid.append(state.early_id_result, style="bold white")
-        parts.append(eid)
-
-    if state.error:
-        err = Text()
-        err.append(f"  ✗ {state.error}", style="bold red")
-        parts.append(err)
-
-    parts.append(Text(""))
 
     track_content = _track_table(state)
     parts.append(Panel(
@@ -265,20 +281,9 @@ def build_renderable(state: TUIState, console: Console | None = None):
         padding=(0, 1),
     ))
 
-    # Skipped tracks (show last 3 max to save space)
-    if state.skipped:
-        skip_text = Text()
-        visible_skips = state.skipped[-3:]
-        for s in visible_skips:
-            skip_text.append(f"  ✗ {s}\n", style="dim red")
-        if len(state.skipped) > 3:
-            skip_text.append(f"    … and {len(state.skipped) - 3} more\n", style="dim")
-        parts.append(skip_text)
-
     # Footer
-    skipped_count = f"  │  {len(state.skipped)} skipped" if state.skipped else ""
     scroll_hint = "  ↑↓ scroll  │" if total > state.VISIBLE_ROWS else ""
-    footer = Text(f" {scroll_hint}  Ctrl+C quit{skipped_count}", style="dim")
+    footer = Text(f" {scroll_hint}  Ctrl+C quit", style="dim")
 
     parts.append(footer)
 

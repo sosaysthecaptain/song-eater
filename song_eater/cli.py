@@ -130,11 +130,16 @@ def _handle_key(key: str | None, state: display.TUIState) -> None:
 
     total = len(state.completed)
     vis = state.VISIBLE_ROWS
+    max_offset = max(0, total - vis)
 
     if key == "up":
+        state.scroll_pinned = False
         state.scroll_offset = max(0, state.scroll_offset - 1)
     elif key == "down":
-        state.scroll_offset = min(max(0, total - vis), state.scroll_offset + 1)
+        state.scroll_offset = min(max_offset, state.scroll_offset + 1)
+        # Re-pin if scrolled back to the bottom
+        if state.scroll_offset >= max_offset:
+            state.scroll_pinned = True
 
 
 # ---------------------------------------------------------------------------
@@ -237,12 +242,15 @@ def main(process, device, output, artist, album, threshold, silence_duration, sa
     shazam_id: _ShazamIdentifier | None = None
     shazam_id_sent = False
 
-    # Now Playing state: poll when recording starts, cache result
-    np_metadata: dict | None = None
+    # Now Playing state
+    np_metadata: dict | None = None       # winning metadata (resolved by vote)
+    np_votes: list[dict] = []             # all polls collected during recording
     np_last_poll: float = 0.0
-    np_current_title: str | None = None  # detect song changes
-    NP_POLL_INTERVAL = 1.0      # re-poll every 1s during recording
-    SHAZAM_DELAY = 15           # seconds before Shazam fallback
+    np_current_title: str | None = None   # detect song changes (polled every 1s)
+    NP_POLL_INTERVAL = 1.0       # title-change detection interval
+    NP_VOTE_INTERVAL = 15.0      # collect a metadata vote every 15s
+    np_last_vote: float = 0.0
+    SHAZAM_DELAY = 15            # seconds before Shazam fallback
 
     # Rendering throttle
     last_render: float = 0.0
@@ -257,11 +265,13 @@ def main(process, device, output, artist, album, threshold, silence_duration, sa
     # Process a completed track
     # ------------------------------------------------------------------
     def _reset_track_state() -> None:
-        nonlocal shazam_id, shazam_id_sent, np_metadata, np_current_title
+        nonlocal shazam_id, shazam_id_sent, np_metadata, np_current_title, np_votes, np_last_vote
         shazam_id = None
         shazam_id_sent = False
         np_metadata = None
+        np_votes = []
         np_current_title = None
+        np_last_vote = 0.0
         state.early_id_result = None
         state.expected_duration = 0.0
         state.phase = "waiting"
@@ -270,10 +280,27 @@ def main(process, device, output, artist, album, threshold, silence_duration, sa
     # Anything shorter is discarded as a snippet/partial.
     MIN_TRACK_SECONDS = 60
 
+    def _resolve_np_votes() -> dict | None:
+        """Pick the winning Now Playing metadata by majority vote on title."""
+        if not np_votes:
+            return None
+        # Count votes by title
+        from collections import Counter
+        title_counts = Counter(v.get("title") for v in np_votes)
+        winning_title = title_counts.most_common(1)[0][0]
+        # Return the most recent poll with the winning title (freshest artwork/duration)
+        for v in reversed(np_votes):
+            if v.get("title") == winning_title:
+                return v
+        return np_votes[-1]
+
     def process_track(audio: np.ndarray) -> None:
-        nonlocal track_num
+        nonlocal track_num, np_metadata
 
         recorded_secs = len(audio) / sample_rate
+
+        # Resolve Now Playing from accumulated votes
+        np_metadata = _resolve_np_votes()
 
         # --- Resolve metadata ---
         metadata = None
@@ -322,24 +349,39 @@ def main(process, device, output, artist, album, threshold, silence_duration, sa
             metadata["track"] = track_num
 
         # --- Reject partial recordings ---
+        # Silently drop tiny snippets (< 20s)
+        if recorded_secs < 20:
+            _reset_track_state()
+            return
+
         expected_dur = metadata.get("duration", 0)
         if expected_dur and expected_dur > 0:
             # We know the expected length — reject if <80%
             if recorded_secs < expected_dur * 0.80:
                 pct = int(recorded_secs / expected_dur * 100)
-                artist = metadata.get('artist', '?')
-                title = metadata.get('title', '?')
-                desc = f"{artist} – {title} ({_fmt_dur(recorded_secs)}/{_fmt_dur(expected_dur)}, {pct}%)"
-                state.error = f"Discarded partial: {desc}"
-                state.skipped.append(desc)
+                reason = f"{_fmt_dur(recorded_secs)}/{_fmt_dur(expected_dur)} ({pct}%)"
+                state.completed.append(display.CompletedTrack(
+                    number=track_num,
+                    artist=metadata.get("artist", "?"),
+                    title=metadata.get("title", "?"),
+                    filename="",
+                    discarded=True,
+                    discard_reason=reason,
+                ))
+                state.scroll_pinned = True
                 _reset_track_state()
                 return
         elif not manual_mode and recorded_secs < MIN_TRACK_SECONDS:
-            # No duration info — use minimum length heuristic
-            title = metadata.get('title', '?')
-            desc = f"{title} ({_fmt_dur(recorded_secs)} — under {MIN_TRACK_SECONDS}s)"
-            state.error = f"Discarded short: {desc}"
-            state.skipped.append(desc)
+            reason = f"{_fmt_dur(recorded_secs)} — under {MIN_TRACK_SECONDS}s"
+            state.completed.append(display.CompletedTrack(
+                number=track_num,
+                artist=metadata.get("artist", "?"),
+                title=metadata.get("title", "?"),
+                filename="",
+                discarded=True,
+                discard_reason=reason,
+            ))
+            state.scroll_pinned = True
             _reset_track_state()
             return
 
@@ -359,10 +401,7 @@ def main(process, device, output, artist, album, threshold, silence_duration, sa
                 title=metadata.get("title", "Unknown"),
                 filename=mp3_path.name,
             ))
-            # Auto-scroll to show the newest track
-            total = len(state.completed)
-            if total > state.VISIBLE_ROWS:
-                state.scroll_offset = total - state.VISIBLE_ROWS
+            state.scroll_pinned = True
         except Exception as e:
             state.error = f"Export failed: {e}"
         finally:
@@ -410,10 +449,10 @@ def main(process, device, output, artist, album, threshold, silence_duration, sa
                             np_metadata = None
                             np_last_poll = 0.0
 
-                        # Poll Now Playing
+                        # Poll Now Playing (1s for title-change detection)
                         if has_nowplaying and not manual_mode and (now - np_last_poll) >= NP_POLL_INTERVAL:
                             np_last_poll = now
-                            np_result = nowplaying.get_now_playing()
+                            np_result = nowplaying.get_now_playing(source_app=process)
                             if np_result and np_result.get("title"):
                                 new_title = np_result.get("title")
 
@@ -433,9 +472,17 @@ def main(process, device, output, artist, album, threshold, silence_duration, sa
                                     state.error = None
                                     shazam_id = None
                                     shazam_id_sent = False
+                                    np_votes = []
+                                    np_last_vote = now
 
                                 np_current_title = new_title
-                                np_metadata = np_result
+
+                                # Collect a vote every NP_VOTE_INTERVAL (or on first poll)
+                                if not np_votes or (now - np_last_vote) >= NP_VOTE_INTERVAL:
+                                    np_votes.append(np_result)
+                                    np_last_vote = now
+
+                                # Display uses most recent poll for responsiveness
                                 dur = np_result.get("duration", 0)
                                 state.expected_duration = dur if dur else 0.0
                                 dur_str = f" ({_fmt_dur(dur)})" if dur else ""

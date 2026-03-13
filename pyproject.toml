@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "song-eater"
-version = "0.1.0"
+version = "1.0.0"
 description = "Record system audio, split tracks, identify, tag, and save as MP3"
 requires-python = ">=3.10,<3.13"
 license = "MIT"
@@ -21,4 +21,4 @@ dependencies = [
 song-eater = "song_eater.cli:main"
 
 [tool.setuptools.package-data]
-song_eater = ["audio_tap", "audio_tap.swift"]
+song_eater = ["audio_tap", "audio_tap.swift", "Info.plist", "entitlements.plist"]
