@@ -120,109 +120,21 @@ class _ShazamIdentifier:
 
 
 # ---------------------------------------------------------------------------
-# Keyboard / editing logic
+# Keyboard logic
 # ---------------------------------------------------------------------------
 
-def _handle_key(key: str | None, state: display.TUIState, track_paths: dict[int, Path]) -> None:
-    """Process a single keypress and mutate *state* accordingly."""
-    if key is None:
+def _handle_key(key: str | None, state: display.TUIState) -> None:
+    """Process a single keypress — arrow keys scroll the track list."""
+    if key is None or not state.completed:
         return
 
-    if state.editing:
-        _handle_edit_key(key, state, track_paths)
-    else:
-        _handle_nav_key(key, state)
-
-
-def _handle_nav_key(key: str, state: display.TUIState) -> None:
-    """Navigation mode: arrow keys, enter to edit, e to enter selection."""
-    if not state.completed:
-        return
-
-    if key == "e" and state.selected_row < 0:
-        # Enter selection mode on last track
-        state.selected_row = len(state.completed) - 1
-        state.selected_col = 0
-        _ensure_visible(state)
-        return
-
-    if state.selected_row < 0:
-        return  # not in selection mode
+    total = len(state.completed)
+    vis = state.VISIBLE_ROWS
 
     if key == "up":
-        state.selected_row = max(0, state.selected_row - 1)
-        _ensure_visible(state)
+        state.scroll_offset = max(0, state.scroll_offset - 1)
     elif key == "down":
-        state.selected_row = min(len(state.completed) - 1, state.selected_row + 1)
-        _ensure_visible(state)
-    elif key == "left":
-        state.selected_col = 0
-    elif key == "right":
-        state.selected_col = 1
-    elif key == "enter":
-        # Start editing
-        track = state.completed[state.selected_row]
-        state.editing = True
-        state.edit_buffer = track.artist if state.selected_col == 0 else track.title
-    elif key == "escape":
-        state.selected_row = -1
-        state.editing = False
-
-
-def _handle_edit_key(key: str, state: display.TUIState, track_paths: dict[int, Path]) -> None:
-    """Edit mode: type to replace, enter to save, escape to cancel."""
-    if key == "escape":
-        state.editing = False
-        return
-
-    if key == "enter":
-        # Save the edit
-        track = state.completed[state.selected_row]
-        mp3_path = track_paths.get(track.number)
-        new_val = state.edit_buffer.strip()
-        if not new_val:
-            new_val = "Unknown"
-
-        old_artist, old_title = track.artist, track.title
-
-        if state.selected_col == 0:
-            track.artist = new_val
-        else:
-            track.title = new_val
-
-        # Re-tag and rename the MP3 if it exists
-        if mp3_path and mp3_path.exists() and (track.artist != old_artist or track.title != old_title):
-            try:
-                from mutagen.id3 import ID3, TIT2, TPE1
-                tags = ID3(str(mp3_path))
-                tags.add(TIT2(encoding=3, text=track.title))
-                tags.add(TPE1(encoding=3, text=track.artist))
-                tags.save()
-
-                new_filename = export._sanitize(f"{track.artist} - {track.title}.mp3")
-                new_path = mp3_path.parent / new_filename
-                if new_path != mp3_path and not new_path.exists():
-                    mp3_path.rename(new_path)
-                    track.filename = new_filename
-                    track_paths[track.number] = new_path
-            except Exception:
-                pass  # best-effort re-tag
-
-        state.editing = False
-        return
-
-    if key == "backspace":
-        state.edit_buffer = state.edit_buffer[:-1]
-    elif len(key) == 1 and key.isprintable():
-        state.edit_buffer += key
-
-
-def _ensure_visible(state: display.TUIState) -> None:
-    """Adjust scroll offset so selected_row is visible."""
-    if state.selected_row < state.scroll_offset:
-        state.scroll_offset = state.selected_row
-    elif state.selected_row >= state.scroll_offset + state.VISIBLE_ROWS:
-        state.scroll_offset = state.selected_row - state.VISIBLE_ROWS + 1
+        state.scroll_offset = min(max(0, total - vis), state.scroll_offset + 1)
 
 
 # ---------------------------------------------------------------------------
@@ -242,11 +154,7 @@ Examples:
 
 \b
 Keyboard controls (during capture):
-  e            Select tracks for editing
-  ↑ ↓          Navigate track list
-  ← →          Switch between Artist / Title columns
-  Enter        Edit selected cell
-  Esc          Cancel edit / deselect
+  ↑ ↓          Scroll track list
   Ctrl+C       Stop recording and exit
 """
 
@@ -315,7 +223,7 @@ def main(process, device, output, artist, album, threshold, silence_duration, sa
     # ------------------------------------------------------------------
     # Set up state
     # ------------------------------------------------------------------
-    state = display.TUIState(source_name=source_label)
+    state = display.TUIState(source_name=source_label, output_dir=str(output))
 
     chunk_reader = recorder.ChunkReader(
         sample_rate=sample_rate,
@@ -328,7 +236,6 @@ def main(process, device, output, artist, album, threshold, silence_duration, sa
     track_num = 0
     shazam_id: _ShazamIdentifier | None = None
     shazam_id_sent = False
-    track_paths: dict[int, Path] = {}
 
     # Now Playing state: poll when recording starts, cache result
     np_metadata: dict | None = None
@@ -393,7 +300,7 @@ def main(process, device, output, artist, album, threshold, silence_duration, sa
         if metadata is None:
             state.phase = "identifying"
             state.error = None
-            live.update(display.build_renderable(state))
+            live.update(display.build_renderable(state, live.console))
 
             with tempfile.NamedTemporaryFile(suffix=".wav", delete=False) as tmp:
                 tmp_path = tmp.name
@@ -438,7 +345,7 @@ def main(process, device, output, artist, album, threshold, silence_duration, sa
 
         # --- Export to MP3 ---
         state.phase = "saving"
-        live.update(display.build_renderable(state))
+        live.update(display.build_renderable(state, live.console))
 
         with tempfile.NamedTemporaryFile(suffix=".wav", delete=False) as tmp:
             tmp_path = tmp.name
@@ -446,13 +353,16 @@ def main(process, device, output, artist, album, threshold, silence_duration, sa
 
         try:
             mp3_path = export.save_track(tmp_path, metadata, output)
-            track_paths[track_num] = mp3_path
             state.completed.append(display.CompletedTrack(
                 number=track_num,
                 artist=metadata.get("artist", "Unknown"),
                 title=metadata.get("title", "Unknown"),
                 filename=mp3_path.name,
             ))
+            # Auto-scroll to show the newest track
+            total = len(state.completed)
+            if total > state.VISIBLE_ROWS:
+                state.scroll_offset = total - state.VISIBLE_ROWS
         except Exception as e:
             state.error = f"Export failed: {e}"
         finally:
@@ -468,7 +378,7 @@ def main(process, device, output, artist, album, threshold, silence_duration, sa
     try:
         keys.start()
         with live:
-            live.update(display.build_renderable(state))
+            live.update(display.build_renderable(state, live.console))
 
             for result in chunk_reader:
                 chunk_count += 1
@@ -485,7 +395,7 @@ def main(process, device, output, artist, album, threshold, silence_duration, sa
 
                 # Handle keyboard
                 key = keys.read_key()
-                _handle_key(key, state, track_paths)
+                _handle_key(key, state)
 
                 # Raw RMS for dB VU meter (no artificial scaling)
                 state.rms_level = result.rms
@@ -534,12 +444,12 @@ def main(process, device, output, artist, album, threshold, silence_duration, sa
 
                     # Throttled render
                     if now - last_render >= RENDER_INTERVAL:
-                        live.update(display.build_renderable(state))
+                        live.update(display.build_renderable(state, live.console))
                         last_render = now
 
                 else:
                     process_track(result.track_audio)
-                    live.update(display.build_renderable(state))
+                    live.update(display.build_renderable(state, live.console))
 
     except KeyboardInterrupt:
         remaining = chunk_reader.flush()

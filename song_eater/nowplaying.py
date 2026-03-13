@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import base64
 import json
 import subprocess
 
@@ -34,11 +35,22 @@ def get_now_playing() -> dict | None:
         except (ValueError, TypeError):
             duration = 0.0
 
+        artwork_data = None
+        artwork_mime = data.get("artworkMimeType", "image/jpeg")
+        raw_art = data.get("artworkData")
+        if raw_art:
+            try:
+                artwork_data = base64.b64decode(raw_art)
+            except Exception:
+                artwork_data = None
+
         return {
             "title": title,
             "artist": artist,
             "album": album,
             "duration": duration,
+            "artwork_data": artwork_data,
+            "artwork_mime": artwork_mime,
         }
     except FileNotFoundError:
         return None

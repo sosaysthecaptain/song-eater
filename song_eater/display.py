@@ -14,6 +14,10 @@ from rich.text import Text
 
 
 # ---------------------------------------------------------------------------
+# Logo
+# ---------------------------------------------------------------------------
+
+# ---------------------------------------------------------------------------
 # State model
 # ---------------------------------------------------------------------------
 
@@ -30,6 +34,7 @@ class TUIState:
     """Mutable state bag that the render function reads."""
 
     source_name: str = ""
+    output_dir: str = "."
     rms_level: float = 0.0          # raw RMS (not scaled)
 
     # "waiting" | "recording" | "identifying" | "saving"
@@ -43,12 +48,6 @@ class TUIState:
     completed: list[CompletedTrack] = field(default_factory=list)
     skipped: int = 0                 # count of discarded partials
     error: str | None = None
-
-    # -- Editing state --
-    selected_row: int = -1          # -1 = no selection
-    selected_col: int = 0           # 0 = artist, 1 = title
-    editing: bool = False
-    edit_buffer: str = ""
 
     # -- Scroll --
     scroll_offset: int = 0
@@ -156,28 +155,7 @@ def _track_table(state: TUIState) -> Table | Text:
 
     for idx in range(start, end):
         t = state.completed[idx]
-        is_selected = (idx == state.selected_row)
-
-        if is_selected and state.editing:
-            if state.selected_col == 0:
-                artist_text = Text(state.edit_buffer + "▏", style="bold reverse white")
-                title_text = Text(t.title)
-            else:
-                artist_text = Text(t.artist)
-                title_text = Text(state.edit_buffer + "▏", style="bold reverse white")
-        elif is_selected:
-            if state.selected_col == 0:
-                artist_text = Text(t.artist, style="bold reverse cyan")
-                title_text = Text(t.title, style="bold cyan")
-            else:
-                artist_text = Text(t.artist, style="bold cyan")
-                title_text = Text(t.title, style="bold reverse cyan")
-        else:
-            artist_text = Text(t.artist)
-            title_text = Text(t.title)
-
-        row_style = ""
-        tbl.add_row(str(t.number), artist_text, title_text, t.filename, style=row_style)
+        tbl.add_row(str(t.number), t.artist, t.title, t.filename)
 
     remaining = total - end
     if remaining > 0:
@@ -190,13 +168,43 @@ def _track_table(state: TUIState) -> Table | Text:
 # Full render
 # ---------------------------------------------------------------------------
 
-def build_renderable(state: TUIState):
+def build_renderable(state: TUIState, console: Console | None = None):
     """Build the full Rich renderable from current state."""
+
+    # Dynamically size the track table to fill the terminal
+    term_height = (console.height if console else 0) or 24
+    # Fixed chrome: outer panel border (2) + padding (2) + header + info +
+    # blank + meter + status + optional early_id + optional error + blank +
+    # tracks panel border (2) + tracks header row (1) + footer
+    chrome = 2 + 2 + 1 + 1 + 1 + 1 + 1 + 1 + 2 + 1 + 1
+    if state.early_id_result:
+        chrome += 1
+    if state.error:
+        chrome += 1
+    # Scroll indicator rows
+    total = len(state.completed)
+    scroll_indicators = 0
+    if total > 0:
+        vis = max(3, term_height - chrome)
+        if state.scroll_offset > 0:
+            scroll_indicators += 1
+        remaining_below = total - min(state.scroll_offset + vis, total)
+        if remaining_below > 0:
+            scroll_indicators += 1
+    state.VISIBLE_ROWS = max(3, term_height - chrome - scroll_indicators)
 
     header = Text()
     header.append("  song-eater", style="bold cyan")
     header.append("  │  ", style="dim")
     header.append(state.source_name, style="bold white")
+
+    info = Text()
+    info.append("  Saving songs from ", style="dim")
+    info.append(state.source_name, style="white")
+    info.append(" to ", style="dim")
+    info.append(state.output_dir, style="white")
+    info.append(" as ", style="dim")
+    info.append("192k MP3", style="white")
 
     meter = Text()
     meter.append("  Level ", style="dim")
@@ -206,6 +214,7 @@ def build_renderable(state: TUIState):
 
     parts: list[Text | Panel | Table] = [
         header,
+        info,
         Text(""),
         meter,
         status,
@@ -233,13 +242,9 @@ def build_renderable(state: TUIState):
     ))
 
     # Footer
-    if state.editing:
-        footer = Text("  Type to edit  │  Enter save  │  Esc cancel", style="dim")
-    elif state.selected_row >= 0:
-        footer = Text("  ↑↓ navigate  │  ←→ column  │  Enter edit  │  Esc deselect  │  Ctrl+C quit", style="dim")
-    else:
-        skipped_str = f"  │  {state.skipped} skipped" if state.skipped else ""
-        footer = Text(f"  e select tracks  │  Ctrl+C quit{skipped_str}", style="dim")
+    skipped_str = f"  │  {state.skipped} skipped" if state.skipped else ""
+    scroll_hint = "  ↑↓ scroll  │" if total > state.VISIBLE_ROWS else ""
+    footer = Text(f" {scroll_hint}  Ctrl+C quit{skipped_str}", style="dim")
 
     parts.append(footer)
 
@@ -247,6 +252,7 @@ def build_renderable(state: TUIState):
         Group(*parts),
         border_style="cyan",
         padding=(1, 2),
+        height=term_height,
     )
 
 

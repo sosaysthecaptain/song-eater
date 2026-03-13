@@ -36,9 +36,10 @@ def save_track(wav_path: str, metadata: dict, output_dir: Path) -> Path:
     tags.add(TALB(encoding=3, text=metadata.get("album", "Unknown")))
     tags.add(TRCK(encoding=3, text=str(metadata.get("track", ""))))
 
-    cover_data = _fetch_cover(metadata.get("cover_url"))
+    cover_data = metadata.get("artwork_data") or _fetch_cover(metadata.get("cover_url"))
     if cover_data:
-        tags.add(APIC(encoding=3, mime="image/jpeg", type=3, desc="Cover", data=cover_data))
+        mime = metadata.get("artwork_mime", "image/jpeg")
+        tags.add(APIC(encoding=3, mime=mime, type=3, desc="Cover", data=cover_data))
 
     tags.save()
     return mp3_path
