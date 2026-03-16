@@ -1,5 +1,7 @@
 """Audio capture and silence-based track splitting."""
 
+import os
+import signal
 import subprocess
 import sys
 import wave
@@ -11,6 +13,21 @@ import sounddevice as sd
 
 
 AUDIO_TAP_PATH = Path(__file__).parent / "audio_tap"
+
+
+def _kill_stale_audio_taps() -> None:
+    """Kill any leftover audio_tap processes from previous runs."""
+    try:
+        result = subprocess.run(
+            ["pgrep", "-f", "audio_tap"],
+            capture_output=True, text=True,
+        )
+        for line in result.stdout.strip().splitlines():
+            pid = int(line.strip())
+            if pid != os.getpid():
+                os.kill(pid, signal.SIGTERM)
+    except Exception:
+        pass
 
 
 def find_device(name_substring: str) -> int:
@@ -46,6 +63,9 @@ def _read_chunks_from_process_tap(
             f"Build it with: make build"
         )
 
+    # Kill any stale audio_tap from a previous run (competing taps cause failures)
+    _kill_stale_audio_taps()
+
     # Use system-wide tap for reliability (per-process tap IOProc doesn't fire).
     # The --system flag captures all system audio.
     proc = subprocess.Popen(
@@ -60,6 +80,8 @@ def _read_chunks_from_process_tap(
     tap_channels = [0]
     ready_event = threading.Event()
 
+    stderr_lines: list[str] = []
+
     def _drain_stderr():
         for raw_line in proc.stderr:
             line = raw_line.decode("utf-8", errors="replace").rstrip()
@@ -68,8 +90,8 @@ def _read_chunks_from_process_tap(
             elif line.startswith("[audio_tap] CHANNELS="):
                 tap_channels[0] = int(line.split("=", 1)[1])
                 ready_event.set()
-            # Swallow audio_tap debug output — don't pollute the TUI
-            pass
+            else:
+                stderr_lines.append(line)
 
     stderr_thread = threading.Thread(target=_drain_stderr, daemon=True)
     stderr_thread.start()
@@ -90,7 +112,17 @@ def _read_chunks_from_process_tap(
         while True:
             data = proc.stdout.read(bytes_per_chunk)
             if not data:
-                break
+                # Subprocess pipe closed — find out why
+                retcode = proc.poll()
+                stderr_thread.join(timeout=1)
+                detail = "\n".join(stderr_lines[-20:]) if stderr_lines else "no stderr output"
+                if retcode is not None and retcode != 0:
+                    raise RuntimeError(
+                        f"audio_tap died with exit code {retcode}:\n{detail}"
+                    )
+                raise RuntimeError(
+                    f"audio_tap stopped unexpectedly (exit code {retcode}):\n{detail}"
+                )
             float_data = np.frombuffer(data, dtype=np.float32)
             expected = chunk_frames * tap_ch
             if len(float_data) < expected:

@@ -8,14 +8,11 @@ from dataclasses import dataclass, field
 
 from rich.console import Console, Group
 from rich.live import Live
+from rich.padding import Padding
 from rich.panel import Panel
 from rich.table import Table
 from rich.text import Text
 
-
-# ---------------------------------------------------------------------------
-# Logo
-# ---------------------------------------------------------------------------
 
 # ---------------------------------------------------------------------------
 # State model
@@ -49,6 +46,7 @@ class TUIState:
 
     completed: list[CompletedTrack] = field(default_factory=list)
     error: str | None = None
+    disk_free_gb: float | None = None   # updated periodically by main loop
 
     # -- Scroll --
     scroll_offset: int = 0
@@ -120,35 +118,35 @@ _LABEL_WIDTH = 10  # "  Level  " / "  Track  " — consistent left margin for ba
 
 
 def _status_line(state: TUIState, bar_width: int = 40) -> Text:
-    if state.phase == "waiting":
-        return Text("  Waiting for audio…", style="dim italic")
+    # Always returns exactly 2 lines so layout doesn't shift.
     if state.phase == "recording":
         elapsed = time.monotonic() - state.record_start
         time_str = _fmt_time(elapsed)
         if state.expected_duration > 0:
             time_str += f" / {_fmt_time(state.expected_duration)}"
-        txt = Text(f"  ● Recording track {state.current_track}  [{time_str}]", style="bold yellow")
+        txt = Text(f"  ● Recording track {state.current_track}  [{time_str}]\n", style="bold yellow")
         if state.expected_duration > 0:
-            txt.append("\n")
             label = "  Track".ljust(_LABEL_WIDTH)
             txt.append(label, style="dim")
             txt.append_text(_progress_bar(elapsed / state.expected_duration, bar_width))
         return txt
-    if state.phase == "identifying":
-        return Text(f"  ◌ Identifying track {state.current_track}…", style="bold magenta")
-    if state.phase == "saving":
-        return Text(f"  ◌ Saving track {state.current_track}…", style="bold blue")
-    return Text(f"  {state.phase}", style="dim")
+    if state.phase == "waiting":
+        txt = Text("  Waiting for audio…\n", style="dim italic")
+    elif state.phase == "identifying":
+        txt = Text(f"  ◌ Identifying track {state.current_track}…\n", style="bold magenta")
+    elif state.phase == "saving":
+        txt = Text(f"  ◌ Saving track {state.current_track}…\n", style="bold blue")
+    else:
+        txt = Text(f"  {state.phase}\n", style="dim")
+    return txt
 
 
 # ---------------------------------------------------------------------------
-# Scrollable, editable track table
+# Scrollable track table
 # ---------------------------------------------------------------------------
 
-def _track_table(state: TUIState) -> Table | Text:
-    if not state.completed:
-        return Text("  No tracks captured yet.", style="dim")
-
+def _track_table(state: TUIState) -> Table:
+    """Always returns a Table with exactly VISIBLE_ROWS data rows (padded if needed)."""
     tbl = Table(
         show_header=True,
         header_style="bold",
@@ -165,18 +163,17 @@ def _track_table(state: TUIState) -> Table | Text:
     total = len(state.completed)
     vis = state.VISIBLE_ROWS
 
+    # Compute which slice to show
     if total <= vis:
-        state.scroll_offset = 0
+        start = 0
     elif state.scroll_pinned:
-        state.scroll_offset = total - vis
+        start = total - vis
+        state.scroll_offset = start
     else:
         state.scroll_offset = max(0, min(state.scroll_offset, total - vis))
+        start = state.scroll_offset
 
-    start = state.scroll_offset
     end = min(start + vis, total)
-
-    if start > 0:
-        tbl.add_row("", Text(f"  ↑ {start} more", style="dim"), "", "")
 
     for idx in range(start, end):
         t = state.completed[idx]
@@ -191,11 +188,27 @@ def _track_table(state: TUIState) -> Table | Text:
         else:
             tbl.add_row(str(t.number), t.artist, t.title, t.filename)
 
-    remaining = total - end
-    if remaining > 0:
-        tbl.add_row("", Text(f"  ↓ {remaining} more", style="dim"), "", "")
+    # Pad with empty rows so the table height is always consistent
+    shown = end - start
+    for _ in range(vis - shown):
+        tbl.add_row("", "", "", "")
 
     return tbl
+
+
+# ---------------------------------------------------------------------------
+# Count rendered lines of a list of Rich renderables
+# ---------------------------------------------------------------------------
+
+def _count_lines(parts: list, console: Console) -> int:
+    """Render parts into a string and count newlines. Cheap and accurate."""
+    # Use a temporary console to measure without printing
+    from io import StringIO
+    buf = StringIO()
+    temp = Console(file=buf, width=console.width, force_terminal=True)
+    for part in parts:
+        temp.print(part)
+    return buf.getvalue().count("\n")
 
 
 # ---------------------------------------------------------------------------
@@ -205,25 +218,8 @@ def _track_table(state: TUIState) -> Table | Text:
 def build_renderable(state: TUIState, console: Console | None = None):
     """Build the full Rich renderable from current state."""
 
-    # Dynamically size the track table to fill the terminal
     term_height = (console.height if console else 0) or 24
-    # Fixed chrome: outer panel border (2) + padding (2) + header + info +
-    # blank + meter + blank + status + blank + song_line + error_line + blank +
-    # tracks panel border (2) + tracks header row (1) + footer
-    chrome = 2 + 2 + 1 + 1 + 1 + 1 + 1 + 1 + 1 + 1 + 1 + 1 + 2 + 1 + 1
-    if state.phase == "recording" and state.expected_duration > 0:
-        chrome += 1  # progress bar line
-    # Scroll indicator rows
-    total = len(state.completed)
-    scroll_indicators = 0
-    if total > 0:
-        vis = max(3, term_height - chrome)
-        if state.scroll_offset > 0:
-            scroll_indicators += 1
-        remaining_below = total - min(state.scroll_offset + vis, total)
-        if remaining_below > 0:
-            scroll_indicators += 1
-    state.VISIBLE_ROWS = max(3, term_height - chrome - scroll_indicators)
+    term_width = (console.width if console else 0) or 80
 
     header = Text()
     header.append("  song-eater", style="bold cyan")
@@ -240,7 +236,6 @@ def build_renderable(state: TUIState, console: Console | None = None):
 
     # Compute bar width from terminal width
     # outer border (2) + padding (4) + label (10) + suffix (~10) = 26 chars overhead
-    term_width = (console.width if console else 0) or 80
     bar_width = max(20, term_width - 26)
 
     meter = Text()
@@ -251,16 +246,34 @@ def build_renderable(state: TUIState, console: Console | None = None):
     status = _status_line(state, bar_width)
 
     # Song name / error (always reserve the line so layout doesn't shift)
-    song_line = Text()
     if state.early_id_result:
-        song_line.append("  ♫ ", style="green")
-        song_line.append(state.early_id_result, style="bold white")
+        song_text = Text()
+        song_text.append("♫ ", style="green")
+        song_text.append(state.early_id_result, style="bold white")
+        song_line = Padding(song_text, (0, 0, 0, 2))
+    else:
+        song_line = Text()
 
-    error_line = Text()
     if state.error:
-        error_line.append(f"  ✗ {state.error}", style="bold red")
+        err_text = Text()
+        err_text.append(f"✗ {state.error}", style="bold red")
+        error_line = Padding(err_text, (0, 0, 0, 2))
+    else:
+        error_line = Text()
 
-    parts: list[Text | Panel | Table] = [
+    # Disk space warning
+    if state.disk_free_gb is not None and state.disk_free_gb < 5.0:
+        disk_text = Text()
+        if state.disk_free_gb < 1.0:
+            disk_text.append(f"⚠ Disk critically low: {state.disk_free_gb:.1f} GB free", style="bold red")
+        else:
+            disk_text.append(f"⚠ Disk space low: {state.disk_free_gb:.1f} GB free", style="yellow")
+        disk_line = Padding(disk_text, (0, 0, 0, 2))
+    else:
+        disk_line = Text()
+
+    # The top section: everything above the tracks panel
+    top_parts = [
         header,
         info,
         Text(""),
@@ -270,21 +283,38 @@ def build_renderable(state: TUIState, console: Console | None = None):
         Text(""),
         song_line,
         error_line,
+        disk_line,
         Text(""),
     ]
 
+    # Footer
+    total = len(state.completed)
+    count_hint = f"  {total} track{'s' if total != 1 else ''}  │" if total else ""
+    footer = Text(f" {count_hint}  ↑↓ scroll  │  Ctrl+C quit", style="dim")
+
+    # Measure the top section + footer to compute remaining space for tracks.
+    # Outer panel: border (2) + padding top/bottom (2) = 4 lines of chrome.
+    # Tracks panel: border (2) + header row (1) = 3 lines of chrome.
+    # Total fixed overhead = 4 + 3 = 7, plus the measured top/footer lines.
+    top_lines = _count_lines(top_parts, console) if console else 12
+    footer_lines = 1
+    tracks_chrome = 3   # tracks panel border (2) + table header row (1)
+    outer_chrome = 4    # outer panel border (2) + padding (2)
+
+    available = term_height - outer_chrome - top_lines - footer_lines - tracks_chrome
+    state.VISIBLE_ROWS = max(3, available)
+
     track_content = _track_table(state)
+    tracks_height = state.VISIBLE_ROWS + tracks_chrome
+
+    parts = list(top_parts)
     parts.append(Panel(
         track_content,
         title="Tracks",
         border_style="green" if state.completed else "dim",
         padding=(0, 1),
+        height=tracks_height,
     ))
-
-    # Footer
-    scroll_hint = "  ↑↓ scroll  │" if total > state.VISIBLE_ROWS else ""
-    footer = Text(f" {scroll_hint}  Ctrl+C quit", style="dim")
-
     parts.append(footer)
 
     return Panel(

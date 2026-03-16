@@ -2,24 +2,33 @@
 
 from __future__ import annotations
 
+import logging
+import os
 import select
 import sys
 import tempfile
 import termios
 import threading
 import time
+import traceback
 import tty
 from pathlib import Path
 
 import click
 import numpy as np
 
-from song_eater import display, export, identify, nowplaying, recorder
+from song_eater import display, export, identify, itunes, nowplaying, recorder
 
 
 def _fmt_dur(secs: float) -> str:
     m, s = divmod(int(secs), 60)
     return f"{m}:{s:02d}"
+
+
+def _disk_free_gb(path: Path) -> float:
+    """Return free disk space in GB for the filesystem containing *path*."""
+    st = os.statvfs(path)
+    return (st.f_bavail * st.f_frsize) / (1024 ** 3)
 
 
 # ---------------------------------------------------------------------------
@@ -251,10 +260,21 @@ def main(process, device, output, artist, album, threshold, silence_duration, sa
     NP_VOTE_INTERVAL = 15.0      # collect a metadata vote every 15s
     np_last_vote: float = 0.0
     SHAZAM_DELAY = 15            # seconds before Shazam fallback
+    itunes_lookup: itunes.ITunesLookup | None = None
+    itunes_sent = False
+
+    # False-split suppression: stash audio when silence triggers a split
+    # but Now Playing says the same song is still playing
+    stashed_audio: list[np.ndarray] = []
 
     # Rendering throttle
     last_render: float = 0.0
     RENDER_INTERVAL = 0.25       # 4 fps
+
+    # Disk space monitoring
+    DISK_CHECK_INTERVAL = 30.0   # check every 30s
+    last_disk_check: float = 0.0
+    MIN_DISK_GB = 0.5            # stop saving below this
 
     # TCC warning
     chunk_count = 0
@@ -266,12 +286,16 @@ def main(process, device, output, artist, album, threshold, silence_duration, sa
     # ------------------------------------------------------------------
     def _reset_track_state() -> None:
         nonlocal shazam_id, shazam_id_sent, np_metadata, np_current_title, np_votes, np_last_vote
+        nonlocal itunes_lookup, itunes_sent
         shazam_id = None
         shazam_id_sent = False
         np_metadata = None
         np_votes = []
         np_current_title = None
         np_last_vote = 0.0
+        itunes_lookup = None
+        itunes_sent = False
+        stashed_audio.clear()
         state.early_id_result = None
         state.expected_duration = 0.0
         state.phase = "waiting"
@@ -385,15 +409,43 @@ def main(process, device, output, artist, album, threshold, silence_duration, sa
             _reset_track_state()
             return
 
+        # --- Enrich with iTunes data (year, high-res artwork) ---
+        # iTunes art is higher res than Now Playing; use it when available,
+        # fall back to Now Playing art otherwise.
+        if itunes_lookup and itunes_lookup.done and itunes_lookup.result:
+            enrichment = itunes_lookup.result
+            if enrichment.get("year") and "year" not in metadata:
+                metadata["year"] = enrichment["year"]
+            if enrichment.get("artwork_data"):
+                metadata["artwork_data"] = enrichment["artwork_data"]
+                metadata["artwork_mime"] = enrichment.get("artwork_mime", "image/jpeg")
+
+        # --- Check disk space before saving ---
+        free_gb = _disk_free_gb(output)
+        state.disk_free_gb = free_gb
+        if free_gb < MIN_DISK_GB:
+            state.error = f"Disk full ({free_gb:.1f} GB free) — cannot save"
+            state.completed.append(display.CompletedTrack(
+                number=track_num,
+                artist=metadata.get("artist", "?"),
+                title=metadata.get("title", "?"),
+                filename="",
+                discarded=True,
+                discard_reason=f"disk full ({free_gb:.1f} GB)",
+            ))
+            state.scroll_pinned = True
+            _reset_track_state()
+            return
+
         # --- Export to MP3 ---
         state.phase = "saving"
         live.update(display.build_renderable(state, live.console))
 
-        with tempfile.NamedTemporaryFile(suffix=".wav", delete=False) as tmp:
-            tmp_path = tmp.name
-        recorder.write_wav(tmp_path, audio, sample_rate)
-
+        tmp_path = None
         try:
+            with tempfile.NamedTemporaryFile(suffix=".wav", delete=False) as tmp:
+                tmp_path = tmp.name
+            recorder.write_wav(tmp_path, audio, sample_rate)
             mp3_path = export.save_track(tmp_path, metadata, output)
             state.completed.append(display.CompletedTrack(
                 number=track_num,
@@ -405,7 +457,8 @@ def main(process, device, output, artist, album, threshold, silence_duration, sa
         except Exception as e:
             state.error = f"Export failed: {e}"
         finally:
-            Path(tmp_path).unlink(missing_ok=True)
+            if tmp_path:
+                Path(tmp_path).unlink(missing_ok=True)
 
         _reset_track_state()
 
@@ -459,9 +512,14 @@ def main(process, device, output, artist, album, threshold, silence_duration, sa
                                 # Song changed — force-split the current track
                                 if np_current_title and new_title != np_current_title:
                                     flushed = chunk_reader.flush()
-                                    if flushed is not None and len(flushed) > sample_rate:
-                                        process_track(flushed)
-                                        live.update(display.build_renderable(state, live.console))
+                                    # Merge any stashed audio from suppressed splits
+                                    parts = stashed_audio + ([flushed] if flushed is not None else [])
+                                    stashed_audio.clear()
+                                    if parts:
+                                        merged = np.concatenate(parts)
+                                        if len(merged) > sample_rate:
+                                            process_track(merged)
+                                            live.update(display.build_renderable(state, live.console))
                                     # Start fresh for the new song
                                     track_num += 1
                                     state.phase = "recording"
@@ -481,6 +539,15 @@ def main(process, device, output, artist, album, threshold, silence_duration, sa
                                 if not np_votes or (now - np_last_vote) >= NP_VOTE_INTERVAL:
                                     np_votes.append(np_result)
                                     np_last_vote = now
+
+                                # Fire iTunes lookup on first identification
+                                if not itunes_sent:
+                                    itunes_lookup = itunes.ITunesLookup(
+                                        np_result.get("artist", ""),
+                                        np_result.get("title", ""),
+                                    )
+                                    itunes_lookup.start()
+                                    itunes_sent = True
 
                                 # Display uses most recent poll for responsiveness
                                 dur = np_result.get("duration", 0)
@@ -506,14 +573,69 @@ def main(process, device, output, artist, album, threshold, silence_duration, sa
                         if state.phase != "recording":
                             state.phase = "waiting"
 
+                    # Duration overrun — song should be done, force-split
+                    # Runs outside chunk_reader.recording gate so it fires even
+                    # when audio goes silent after a false-split stash.
+                    if (
+                        state.expected_duration > 0
+                        and state.phase == "recording"
+                        and (now - state.record_start) > state.expected_duration + 5.0
+                    ):
+                        flushed = chunk_reader.flush()
+                        parts = stashed_audio + ([flushed] if flushed is not None else [])
+                        stashed_audio.clear()
+                        if parts:
+                            merged = np.concatenate(parts)
+                            if len(merged) > sample_rate:
+                                process_track(merged)
+                                live.update(display.build_renderable(state, live.console))
+                        # Reset for next track
+                        track_num += 1
+                        state.phase = "waiting"
+                        state.current_track = track_num
+                        state.record_start = now
+                        state.early_id_result = None
+                        state.expected_duration = 0.0
+                        state.error = None
+                        shazam_id = None
+                        shazam_id_sent = False
+                        np_votes = []
+                        np_last_vote = now
+                        np_current_title = None
+                        itunes_lookup = None
+                        itunes_sent = False
+
+                    # Periodic disk space check
+                    if now - last_disk_check >= DISK_CHECK_INTERVAL:
+                        state.disk_free_gb = _disk_free_gb(output)
+                        last_disk_check = now
+
                     # Throttled render
                     if now - last_render >= RENDER_INTERVAL:
                         live.update(display.build_renderable(state, live.console))
                         last_render = now
 
                 else:
-                    process_track(result.track_audio)
-                    live.update(display.build_renderable(state, live.console))
+                    # Silence triggered a split — but is the same song still playing?
+                    np_still_playing = False
+                    if has_nowplaying and not manual_mode and np_current_title:
+                        np_check = nowplaying.get_now_playing(source_app=process)
+                        if np_check and np_check.get("title") == np_current_title:
+                            np_still_playing = True
+
+                    if np_still_playing:
+                        # False split — stash the audio fragment and keep going
+                        stashed_audio.append(result.track_audio)
+                    else:
+                        # Real split — merge any stashed fragments and process
+                        if stashed_audio:
+                            stashed_audio.append(result.track_audio)
+                            merged = np.concatenate(stashed_audio)
+                            stashed_audio.clear()
+                            process_track(merged)
+                        else:
+                            process_track(result.track_audio)
+                        live.update(display.build_renderable(state, live.console))
 
     except KeyboardInterrupt:
         remaining = chunk_reader.flush()
@@ -521,6 +643,19 @@ def main(process, device, output, artist, album, threshold, silence_duration, sa
             track_num += 1
             state.current_track = track_num
             process_track(remaining)
+    except Exception:
+        # Log the full traceback so silent crashes leave a trail
+        crash_log = output / "song-eater-crash.log"
+        tb = traceback.format_exc()
+        try:
+            with open(crash_log, "a") as f:
+                f.write(f"\n--- {time.strftime('%Y-%m-%d %H:%M:%S')} ---\n")
+                f.write(tb)
+        except OSError:
+            pass  # disk truly full — nothing we can do
+        # Show the user what happened
+        click.echo(f"\n\nCrashed unexpectedly:\n{tb}", err=True)
+        click.echo(f"Full traceback written to {crash_log}", err=True)
     finally:
         keys.stop()
 
