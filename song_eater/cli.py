@@ -300,9 +300,16 @@ def main(process, device, output, artist, album, threshold, silence_duration, sa
         state.expected_duration = 0.0
         state.phase = "waiting"
 
-    # Minimum recording length (seconds) to be considered a full track.
-    # Anything shorter is discarded as a snippet/partial.
-    MIN_TRACK_SECONDS = 60
+    def _log_failure(metadata: dict, reason: str) -> None:
+        """Append a failed track to song_eater_failed_log.txt in the output dir."""
+        try:
+            with open(output / "song_eater_failed_log.txt", "a") as f:
+                artist = metadata.get("artist", "?")
+                title = metadata.get("title", "?")
+                album = metadata.get("album", "?")
+                f.write(f"{time.strftime('%Y-%m-%d %H:%M:%S')}  {artist} – {title}  [{album}]  ({reason})\n")
+        except OSError:
+            pass
 
     def _resolve_np_votes() -> dict | None:
         """Pick the winning Now Playing metadata by majority vote on title."""
@@ -373,30 +380,13 @@ def main(process, device, output, artist, album, threshold, silence_duration, sa
             metadata["track"] = track_num
 
         # --- Reject partial recordings ---
-        # Silently drop tiny snippets (< 20s)
-        if recorded_secs < 20:
-            _reset_track_state()
-            return
-
+        # Only reject when we know it's a snippet of a longer song.
+        # Short songs are valid; we don't want to reject them.
         expected_dur = metadata.get("duration", 0)
-        if expected_dur and expected_dur > 0:
-            # We know the expected length — reject if <80%
-            if recorded_secs < expected_dur * 0.80:
-                pct = int(recorded_secs / expected_dur * 100)
-                reason = f"{_fmt_dur(recorded_secs)}/{_fmt_dur(expected_dur)} ({pct}%)"
-                state.completed.append(display.CompletedTrack(
-                    number=track_num,
-                    artist=metadata.get("artist", "?"),
-                    title=metadata.get("title", "?"),
-                    filename="",
-                    discarded=True,
-                    discard_reason=reason,
-                ))
-                state.scroll_pinned = True
-                _reset_track_state()
-                return
-        elif not manual_mode and recorded_secs < MIN_TRACK_SECONDS:
-            reason = f"{_fmt_dur(recorded_secs)} — under {MIN_TRACK_SECONDS}s"
+        shortfall = expected_dur - recorded_secs if expected_dur else 0
+        if expected_dur and expected_dur > 0 and recorded_secs < expected_dur * 0.65 and shortfall > 30:
+            pct = int(recorded_secs / expected_dur * 100)
+            reason = f"{_fmt_dur(recorded_secs)}/{_fmt_dur(expected_dur)} ({pct}%)"
             state.completed.append(display.CompletedTrack(
                 number=track_num,
                 artist=metadata.get("artist", "?"),
@@ -406,6 +396,7 @@ def main(process, device, output, artist, album, threshold, silence_duration, sa
                 discard_reason=reason,
             ))
             state.scroll_pinned = True
+            _log_failure(metadata, f"partial: {reason}")
             _reset_track_state()
             return
 
@@ -434,6 +425,7 @@ def main(process, device, output, artist, album, threshold, silence_duration, sa
                 discard_reason=f"disk full ({free_gb:.1f} GB)",
             ))
             state.scroll_pinned = True
+            _log_failure(metadata, f"disk full ({free_gb:.1f} GB)")
             _reset_track_state()
             return
 
@@ -456,6 +448,7 @@ def main(process, device, output, artist, album, threshold, silence_duration, sa
             state.scroll_pinned = True
         except Exception as e:
             state.error = f"Export failed: {e}"
+            _log_failure(metadata, f"export failed: {e}")
         finally:
             if tmp_path:
                 Path(tmp_path).unlink(missing_ok=True)

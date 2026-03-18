@@ -301,7 +301,7 @@ def build_renderable(state: TUIState, console: Console | None = None):
     tracks_chrome = 3   # tracks panel border (2) + table header row (1)
     outer_chrome = 4    # outer panel border (2) + padding (2)
 
-    available = term_height - outer_chrome - top_lines - footer_lines - tracks_chrome
+    available = term_height - outer_chrome - top_lines - footer_lines - tracks_chrome - 1
     state.VISIBLE_ROWS = max(3, available)
 
     track_content = _track_table(state)
