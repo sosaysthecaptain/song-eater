@@ -49,8 +49,29 @@ def save_track(wav_path: str, metadata: dict, output_dir: Path) -> Path:
     return mp3_path
 
 
-def _sanitize(name: str) -> str:
-    return re.sub(r'[<>:"/\\|?*]', "_", name).strip()
+def _sanitize(name: str, max_bytes: int = 250) -> str:
+    """Sanitize a filename and truncate to fit within filesystem byte limits.
+
+    APFS allows 255 bytes per filename component.  We leave a small margin
+    and truncate the *stem* (preserving the extension) when needed.
+    """
+    name = re.sub(r'[<>:"/\\|?*]', "_", name).strip()
+
+    # Split off extension so we never truncate it
+    stem, _, ext = name.rpartition(".")
+    if not stem:
+        stem, ext = ext, ""
+    else:
+        ext = "." + ext
+
+    max_stem_bytes = max_bytes - len(ext.encode("utf-8"))
+    encoded = stem.encode("utf-8")
+    if len(encoded) <= max_stem_bytes:
+        return stem + ext
+
+    # Truncate by decoding back from a byte slice (safe for multi-byte chars)
+    truncated = encoded[:max_stem_bytes].decode("utf-8", errors="ignore").rstrip()
+    return truncated + ext
 
 
 def _fetch_cover(url: str | None) -> bytes | None:
