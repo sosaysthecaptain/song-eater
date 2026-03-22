@@ -196,7 +196,7 @@ Keyboard controls (during capture):
     help="Album name for manual mode.",
 )
 @click.option(
-    "--threshold", "-t", type=float, default=0.01,
+    "--threshold", "-t", type=float, default=0.002,
     help="RMS silence threshold for track splitting.",
     show_default=True,
 )
