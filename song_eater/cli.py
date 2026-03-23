@@ -20,6 +20,24 @@ import numpy as np
 from song_eater import display, export, identify, itunes, nowplaying, recorder
 
 
+def _normalize_album(name: str) -> str:
+    """Lowercase, strip punctuation and whitespace for fuzzy album comparison."""
+    import re
+    return re.sub(r"[^a-z0-9 ]", "", name.lower()).strip()
+
+
+def _albums_match(np_album: str, itunes_album: str) -> bool:
+    """Check if Now Playing and iTunes album names refer to the same album."""
+    if not np_album or not itunes_album:
+        return False
+    a = _normalize_album(np_album)
+    b = _normalize_album(itunes_album)
+    if not a or not b:
+        return False
+    # Exact match or one contains the other (handles prefixes like "Holst: The Planets")
+    return a == b or a in b or b in a
+
+
 def _fmt_dur(secs: float) -> str:
     m, s = divmod(int(secs), 60)
     return f"{m}:{s:02d}"
@@ -401,15 +419,20 @@ def main(process, device, output, artist, album, threshold, silence_duration, sa
             return
 
         # --- Enrich with iTunes data (year, high-res artwork) ---
-        # iTunes art is higher res than Now Playing; use it when available,
-        # fall back to Now Playing art otherwise.
+        # Only use iTunes artwork when the album matches Now Playing,
+        # otherwise we get art from compilations/singles/wrong albums.
         if itunes_lookup and itunes_lookup.done and itunes_lookup.result:
             enrichment = itunes_lookup.result
             if enrichment.get("year") and "year" not in metadata:
                 metadata["year"] = enrichment["year"]
             if enrichment.get("track_number"):
                 metadata["track"] = enrichment["track_number"]
-            if enrichment.get("artwork_data"):
+
+            albums_match = _albums_match(
+                metadata.get("album", ""),
+                enrichment.get("album", ""),
+            )
+            if albums_match and enrichment.get("artwork_data"):
                 metadata["artwork_data"] = enrichment["artwork_data"]
                 metadata["artwork_mime"] = enrichment.get("artwork_mime", "image/jpeg")
 
