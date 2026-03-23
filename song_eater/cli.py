@@ -407,6 +407,8 @@ def main(process, device, output, artist, album, threshold, silence_duration, sa
             enrichment = itunes_lookup.result
             if enrichment.get("year") and "year" not in metadata:
                 metadata["year"] = enrichment["year"]
+            if enrichment.get("track_number"):
+                metadata["track"] = enrichment["track_number"]
             if enrichment.get("artwork_data"):
                 metadata["artwork_data"] = enrichment["artwork_data"]
                 metadata["artwork_mime"] = enrichment.get("artwork_mime", "image/jpeg")

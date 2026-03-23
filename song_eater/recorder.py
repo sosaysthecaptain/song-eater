@@ -259,6 +259,7 @@ class ChunkReader:
         chunk_frames: int = 1024,
         device: int | None = None,
         process_name: str | None = None,
+        pre_roll: float = 3.0,
     ):
         self.sample_rate = sample_rate
         self.channels = channels
@@ -276,6 +277,11 @@ class ChunkReader:
         self._chunks: list[np.ndarray] = []
         self._silent_count = 0
         self._has_audio = False
+
+        # Pre-roll ring buffer: keeps the last N seconds of audio so we
+        # can prepend it when a track starts (catches quiet openings).
+        self._pre_roll_max = int(pre_roll * sample_rate / chunk_frames)
+        self._pre_roll: list[np.ndarray] = []
 
     @property
     def recording(self) -> bool:
@@ -318,6 +324,10 @@ class ChunkReader:
         track_audio = None
 
         if not is_silent:
+            if not self._has_audio:
+                # First non-silent chunk — prepend the pre-roll buffer
+                self._chunks.extend(self._pre_roll)
+                self._pre_roll.clear()
             self._has_audio = True
             self._silent_count = 0
             self._chunks.append(data)
@@ -335,6 +345,11 @@ class ChunkReader:
                     self._chunks.clear()
                     self._silent_count = 0
                     self._has_audio = False
+            else:
+                # Not recording — feed the pre-roll ring buffer
+                self._pre_roll.append(data)
+                if len(self._pre_roll) > self._pre_roll_max:
+                    self._pre_roll.pop(0)
 
         return ChunkResult(
             chunk=data,
