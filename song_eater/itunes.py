@@ -87,6 +87,7 @@ def search(artist: str, title: str) -> dict | None:
     return {
         "year": year,
         "album": hit.get("collectionName", ""),
+        "album_artist": hit.get("artistName", ""),
         "track_number": hit.get("trackNumber"),
         "artwork_url": artwork_url,
         "artwork_data": artwork_data,

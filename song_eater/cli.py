@@ -38,6 +38,32 @@ def _albums_match(np_album: str, itunes_album: str) -> bool:
     return a == b or a in b or b in a
 
 
+def _extract_composer(np_artist: str, itunes_artist: str) -> str | None:
+    """Derive composer from the difference between Now Playing and iTunes artist.
+
+    Now Playing for classical: "Bach, Berliner Philharmoniker, Karajan"
+    iTunes artistName:         "Berliner Philharmoniker & Herbert von Karajan"
+
+    The leading names in NP that don't appear in the iTunes artist are the composer.
+    """
+    if not np_artist or not itunes_artist:
+        return None
+    itunes_lower = itunes_artist.lower()
+    parts = [p.strip() for p in np_artist.split(",")]
+    composer_parts = []
+    for part in parts:
+        # Stop at the first name that appears in the iTunes artist string
+        if part.lower() in itunes_lower or any(
+            word.lower() in itunes_lower
+            for word in part.split() if len(word) > 3
+        ):
+            break
+        composer_parts.append(part)
+    if composer_parts and len(composer_parts) < len(parts):
+        return ", ".join(composer_parts)
+    return None
+
+
 def _fmt_dur(secs: float) -> str:
     m, s = divmod(int(secs), 60)
     return f"{m}:{s:02d}"
@@ -427,6 +453,19 @@ def main(process, device, output, artist, album, threshold, silence_duration, sa
                 metadata["year"] = enrichment["year"]
             if enrichment.get("track_number"):
                 metadata["track"] = enrichment["track_number"]
+
+            # Album artist from iTunes (the performer, not composer)
+            itunes_artist = enrichment.get("album_artist", "")
+            if itunes_artist:
+                metadata["album_artist"] = itunes_artist
+                # Derive composer: if Now Playing artist starts with names
+                # not in the iTunes artistName, those are likely the composer.
+                # e.g. NP="Bach, Berliner Phil, Karajan", iTunes="Berliner Phil"
+                # → composer="Bach"
+                np_artist = metadata.get("artist", "")
+                composer = _extract_composer(np_artist, itunes_artist)
+                if composer:
+                    metadata["composer"] = composer
 
             albums_match = _albums_match(
                 metadata.get("album", ""),

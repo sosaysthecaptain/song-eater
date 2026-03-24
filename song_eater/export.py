@@ -5,7 +5,7 @@ import subprocess
 import urllib.request
 from pathlib import Path
 
-from mutagen.id3 import APIC, ID3, TALB, TDRC, TIT2, TPE1, TRCK
+from mutagen.id3 import APIC, ID3, TALB, TCOM, TDRC, TIT2, TPE1, TPE2, TRCK
 
 
 def save_track(wav_path: str, metadata: dict, output_dir: Path) -> Path:
@@ -35,6 +35,14 @@ def save_track(wav_path: str, metadata: dict, output_dir: Path) -> Path:
     tags.add(TPE1(encoding=3, text=artist))
     tags.add(TALB(encoding=3, text=metadata.get("album", "Unknown")))
     tags.add(TRCK(encoding=3, text=str(metadata.get("track", ""))))
+
+    album_artist = metadata.get("album_artist")
+    if album_artist:
+        tags.add(TPE2(encoding=3, text=album_artist))
+
+    composer = metadata.get("composer")
+    if composer:
+        tags.add(TCOM(encoding=3, text=composer))
 
     year = metadata.get("year")
     if year:
