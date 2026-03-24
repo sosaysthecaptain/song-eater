@@ -89,6 +89,7 @@ def search(artist: str, title: str) -> dict | None:
         "album": hit.get("collectionName", ""),
         "album_artist": hit.get("artistName", ""),
         "track_number": hit.get("trackNumber"),
+        "disc_number": hit.get("discNumber"),
         "artwork_url": artwork_url,
         "artwork_data": artwork_data,
         "artwork_mime": "image/jpeg",

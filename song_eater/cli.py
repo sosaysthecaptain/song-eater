@@ -453,6 +453,8 @@ def main(process, device, output, artist, album, threshold, silence_duration, sa
                 metadata["year"] = enrichment["year"]
             if enrichment.get("track_number"):
                 metadata["track"] = enrichment["track_number"]
+            if enrichment.get("disc_number"):
+                metadata["disc_number"] = enrichment["disc_number"]
 
             # Album artist from iTunes (the performer, not composer)
             itunes_artist = enrichment.get("album_artist", "")
