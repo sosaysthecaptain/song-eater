@@ -20,23 +20,6 @@ import numpy as np
 from song_eater import display, export, identify, itunes, nowplaying, recorder
 
 
-def _normalize_album(name: str) -> str:
-    """Lowercase, strip punctuation and whitespace for fuzzy album comparison."""
-    import re
-    return re.sub(r"[^a-z0-9 ]", "", name.lower()).strip()
-
-
-def _albums_match(np_album: str, itunes_album: str) -> bool:
-    """Check if Now Playing and iTunes album names refer to the same album."""
-    if not np_album or not itunes_album:
-        return False
-    a = _normalize_album(np_album)
-    b = _normalize_album(itunes_album)
-    if not a or not b:
-        return False
-    # Exact match or one contains the other (handles prefixes like "Holst: The Planets")
-    return a == b or a in b or b in a
-
 
 def _extract_composer(np_artist: str, itunes_artist: str) -> str | None:
     """Derive composer from the difference between Now Playing and iTunes artist.
@@ -445,8 +428,8 @@ def main(process, device, output, artist, album, threshold, silence_duration, sa
             return
 
         # --- Enrich with iTunes data ---
-        # Only use album-specific data (artwork, track/disc number) when
-        # iTunes found the same album. Year and composer are song-level.
+        # album_match=True means iTunes found the track via album-first
+        # lookup, so track/disc number and artwork are from the correct release.
         if itunes_lookup and itunes_lookup.done and itunes_lookup.result:
             enrichment = itunes_lookup.result
             if enrichment.get("year") and "year" not in metadata:
@@ -461,12 +444,8 @@ def main(process, device, output, artist, album, threshold, silence_duration, sa
                 if composer:
                     metadata["composer"] = composer
 
-            # Album-specific fields: only when albums match
-            albums_match = _albums_match(
-                metadata.get("album", ""),
-                enrichment.get("album", ""),
-            )
-            if albums_match:
+            # Album-specific fields: only when album-verified
+            if enrichment.get("album_match"):
                 if enrichment.get("track_number"):
                     metadata["track"] = enrichment["track_number"]
                 if enrichment.get("disc_number"):
