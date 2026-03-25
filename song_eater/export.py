@@ -61,6 +61,29 @@ def save_track(wav_path: str, metadata: dict, output_dir: Path) -> Path:
     return mp3_path
 
 
+def retag(mp3_path: Path, updates: dict) -> None:
+    """Update specific ID3 tags on an existing MP3 without re-encoding.
+
+    *updates* can contain: track, disc_number, year, album_artist, composer,
+    artwork_data, artwork_mime.
+    """
+    tags = ID3(str(mp3_path))
+    if "track" in updates:
+        tags.add(TRCK(encoding=3, text=str(updates["track"])))
+    if "disc_number" in updates:
+        tags.add(TPOS(encoding=3, text=str(updates["disc_number"])))
+    if "year" in updates:
+        tags.add(TDRC(encoding=3, text=updates["year"]))
+    if "album_artist" in updates:
+        tags.add(TPE2(encoding=3, text=updates["album_artist"]))
+    if "composer" in updates:
+        tags.add(TCOM(encoding=3, text=updates["composer"]))
+    if updates.get("artwork_data"):
+        mime = updates.get("artwork_mime", "image/jpeg")
+        tags.add(APIC(encoding=3, mime=mime, type=3, desc="Cover", data=updates["artwork_data"]))
+    tags.save()
+
+
 def _sanitize(name: str, max_bytes: int = 250) -> str:
     """Sanitize a filename and truncate to fit within filesystem byte limits.
 

@@ -26,6 +26,8 @@ class CompletedTrack:
     filename: str
     discarded: bool = False
     discard_reason: str = ""
+    album: str = ""
+    itunes_matched: bool = False  # True once album-verified iTunes data applied
 
 
 @dataclass

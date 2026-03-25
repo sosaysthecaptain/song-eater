@@ -25,11 +25,21 @@ class ITunesLookup:
         threading.Thread(target=self._run, daemon=True).start()
 
     def _run(self) -> None:
+        import time as _time
         try:
             self._result = search(
                 self._artist, self._title, self._album,
                 collection_id=self._collection_id,
             )
+            # Retry once after 5s if we didn't get an album match
+            if not self._result or not self._result.get("album_match"):
+                _time.sleep(5)
+                retry = search(
+                    self._artist, self._title, self._album,
+                    collection_id=self._collection_id,
+                )
+                if retry and retry.get("album_match"):
+                    self._result = retry
         except Exception:
             pass
         finally:

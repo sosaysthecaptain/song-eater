@@ -359,6 +359,41 @@ def main(process, device, output, artist, album, threshold, silence_duration, sa
                 return v
         return np_votes[-1]
 
+    def _retag_prior_tracks(collection_id: int, album_name: str) -> None:
+        """Retroactively fix up earlier tracks on the same album with iTunes data."""
+        for ct in state.completed:
+            if ct.discarded or ct.itunes_matched or not ct.filename:
+                continue
+            if ct.album != album_name:
+                continue
+            # Look up this track in the cached collection
+            result = itunes._find_track_in_collection(collection_id, ct.title)
+            if not result:
+                continue
+            # Re-tag the MP3 on disk
+            mp3_path = output / ct.filename
+            if not mp3_path.exists():
+                continue
+            updates = {}
+            if result.get("track_number"):
+                updates["track"] = result["track_number"]
+                ct.number = result["track_number"]
+            if result.get("disc_number"):
+                updates["disc_number"] = result["disc_number"]
+            if result.get("year"):
+                updates["year"] = result["year"]
+            if result.get("album_artist"):
+                updates["album_artist"] = result["album_artist"]
+            if result.get("artwork_data"):
+                updates["artwork_data"] = result["artwork_data"]
+                updates["artwork_mime"] = result.get("artwork_mime", "image/jpeg")
+            if updates:
+                try:
+                    export.retag(mp3_path, updates)
+                    ct.itunes_matched = True
+                except Exception:
+                    pass
+
     def process_track(audio: np.ndarray) -> None:
         nonlocal track_num, np_metadata, itunes_collection_id, itunes_cached_album
 
@@ -454,9 +489,14 @@ def main(process, device, output, artist, album, threshold, silence_duration, sa
             # Album-specific fields: only when album-verified
             if enrichment.get("album_match"):
                 # Cache this collection for subsequent tracks on the same album
-                if enrichment.get("collection_id"):
-                    itunes_collection_id = enrichment["collection_id"]
-                    itunes_cached_album = metadata.get("album", "")
+                new_cid = enrichment.get("collection_id")
+                album_name = metadata.get("album", "")
+                if new_cid and new_cid != itunes_collection_id:
+                    itunes_collection_id = new_cid
+                    itunes_cached_album = album_name
+                    # Retroactively fix up earlier tracks on this album
+                    _retag_prior_tracks(new_cid, album_name)
+                metadata["_itunes_matched"] = True
                 if enrichment.get("track_number"):
                     metadata["track"] = enrichment["track_number"]
                 if enrichment.get("disc_number"):
@@ -494,10 +534,12 @@ def main(process, device, output, artist, album, threshold, silence_duration, sa
             recorder.write_wav(tmp_path, audio, sample_rate)
             mp3_path = export.save_track(tmp_path, metadata, output)
             state.completed.append(display.CompletedTrack(
-                number=track_num,
+                number=metadata.get("track", track_num),
                 artist=metadata.get("artist", "Unknown"),
                 title=metadata.get("title", "Unknown"),
                 filename=mp3_path.name,
+                album=metadata.get("album", ""),
+                itunes_matched=bool(metadata.get("_itunes_matched")),
             ))
             state.scroll_pinned = True
         except Exception as e:
