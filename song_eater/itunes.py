@@ -11,9 +11,10 @@ import urllib.request
 class ITunesLookup:
     """Fire-and-forget iTunes Search query. Results available via .result property."""
 
-    def __init__(self, artist: str, title: str):
+    def __init__(self, artist: str, title: str, album: str = ""):
         self._artist = artist
         self._title = title
+        self._album = album
         self._result: dict | None = None
         self._done = False
 
@@ -22,7 +23,7 @@ class ITunesLookup:
 
     def _run(self) -> None:
         try:
-            self._result = search(self._artist, self._title)
+            self._result = search(self._artist, self._title, self._album)
         except Exception:
             pass
         finally:
@@ -37,13 +38,14 @@ class ITunesLookup:
         return self._result
 
 
-def search(artist: str, title: str) -> dict | None:
+def search(artist: str, title: str, album: str = "") -> dict | None:
     """Query iTunes Search API and return enrichment data.
 
     Returns dict with keys: year, artwork_url, artwork_data, artwork_mime.
     Returns None if no match found.
     """
-    query = f"{artist} {title}"
+    # Include album in the query to bias toward the correct release
+    query = f"{artist} {title} {album}".strip()
     params = urllib.parse.urlencode({
         "term": query,
         "media": "music",

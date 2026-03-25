@@ -444,38 +444,36 @@ def main(process, device, output, artist, album, threshold, silence_duration, sa
             _reset_track_state()
             return
 
-        # --- Enrich with iTunes data (year, high-res artwork) ---
-        # Only use iTunes artwork when the album matches Now Playing,
-        # otherwise we get art from compilations/singles/wrong albums.
+        # --- Enrich with iTunes data ---
+        # Only use album-specific data (artwork, track/disc number) when
+        # iTunes found the same album. Year and composer are song-level.
         if itunes_lookup and itunes_lookup.done and itunes_lookup.result:
             enrichment = itunes_lookup.result
             if enrichment.get("year") and "year" not in metadata:
                 metadata["year"] = enrichment["year"]
-            if enrichment.get("track_number"):
-                metadata["track"] = enrichment["track_number"]
-            if enrichment.get("disc_number"):
-                metadata["disc_number"] = enrichment["disc_number"]
 
-            # Album artist from iTunes (the performer, not composer)
+            # Album artist / composer derivation (song-level, always safe)
             itunes_artist = enrichment.get("album_artist", "")
             if itunes_artist:
                 metadata["album_artist"] = itunes_artist
-                # Derive composer: if Now Playing artist starts with names
-                # not in the iTunes artistName, those are likely the composer.
-                # e.g. NP="Bach, Berliner Phil, Karajan", iTunes="Berliner Phil"
-                # → composer="Bach"
                 np_artist = metadata.get("artist", "")
                 composer = _extract_composer(np_artist, itunes_artist)
                 if composer:
                     metadata["composer"] = composer
 
+            # Album-specific fields: only when albums match
             albums_match = _albums_match(
                 metadata.get("album", ""),
                 enrichment.get("album", ""),
             )
-            if albums_match and enrichment.get("artwork_data"):
-                metadata["artwork_data"] = enrichment["artwork_data"]
-                metadata["artwork_mime"] = enrichment.get("artwork_mime", "image/jpeg")
+            if albums_match:
+                if enrichment.get("track_number"):
+                    metadata["track"] = enrichment["track_number"]
+                if enrichment.get("disc_number"):
+                    metadata["disc_number"] = enrichment["disc_number"]
+                if enrichment.get("artwork_data"):
+                    metadata["artwork_data"] = enrichment["artwork_data"]
+                    metadata["artwork_mime"] = enrichment.get("artwork_mime", "image/jpeg")
 
         # --- Check disk space before saving ---
         free_gb = _disk_free_gb(output)
@@ -604,6 +602,7 @@ def main(process, device, output, artist, album, threshold, silence_duration, sa
                                     itunes_lookup = itunes.ITunesLookup(
                                         np_result.get("artist", ""),
                                         np_result.get("title", ""),
+                                        np_result.get("album", ""),
                                     )
                                     itunes_lookup.start()
                                     itunes_sent = True
