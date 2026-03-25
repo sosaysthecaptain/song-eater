@@ -289,6 +289,8 @@ def main(process, device, output, artist, album, threshold, silence_duration, sa
     SHAZAM_DELAY = 15            # seconds before Shazam fallback
     itunes_lookup: itunes.ITunesLookup | None = None
     itunes_sent = False
+    itunes_collection_id: int | None = None  # cached from previous track on same album
+    itunes_cached_album: str = ""             # album name the cache belongs to
 
     # False-split suppression: stash audio when silence triggers a split
     # but Now Playing says the same song is still playing
@@ -358,7 +360,7 @@ def main(process, device, output, artist, album, threshold, silence_duration, sa
         return np_votes[-1]
 
     def process_track(audio: np.ndarray) -> None:
-        nonlocal track_num, np_metadata
+        nonlocal track_num, np_metadata, itunes_collection_id, itunes_cached_album
 
         recorded_secs = len(audio) / sample_rate
 
@@ -451,6 +453,10 @@ def main(process, device, output, artist, album, threshold, silence_duration, sa
 
             # Album-specific fields: only when album-verified
             if enrichment.get("album_match"):
+                # Cache this collection for subsequent tracks on the same album
+                if enrichment.get("collection_id"):
+                    itunes_collection_id = enrichment["collection_id"]
+                    itunes_cached_album = metadata.get("album", "")
                 if enrichment.get("track_number"):
                     metadata["track"] = enrichment["track_number"]
                 if enrichment.get("disc_number"):
@@ -583,10 +589,16 @@ def main(process, device, output, artist, album, threshold, silence_duration, sa
 
                                 # Fire iTunes lookup on first identification
                                 if not itunes_sent:
+                                    # Reuse cached collection if same album
+                                    cached_cid = None
+                                    np_album = np_result.get("album", "")
+                                    if itunes_collection_id and np_album and np_album == itunes_cached_album:
+                                        cached_cid = itunes_collection_id
                                     itunes_lookup = itunes.ITunesLookup(
                                         np_result.get("artist", ""),
                                         np_result.get("title", ""),
-                                        np_result.get("album", ""),
+                                        np_album,
+                                        collection_id=cached_cid,
                                     )
                                     itunes_lookup.start()
                                     itunes_sent = True

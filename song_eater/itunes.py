@@ -12,10 +12,12 @@ import urllib.request
 class ITunesLookup:
     """Fire-and-forget iTunes Search query. Results available via .result property."""
 
-    def __init__(self, artist: str, title: str, album: str = ""):
+    def __init__(self, artist: str, title: str, album: str = "",
+                 collection_id: int | None = None):
         self._artist = artist
         self._title = title
         self._album = album
+        self._collection_id = collection_id
         self._result: dict | None = None
         self._done = False
 
@@ -24,7 +26,10 @@ class ITunesLookup:
 
     def _run(self) -> None:
         try:
-            self._result = search(self._artist, self._title, self._album)
+            self._result = search(
+                self._artist, self._title, self._album,
+                collection_id=self._collection_id,
+            )
         except Exception:
             pass
         finally:
@@ -71,7 +76,7 @@ def _fetch_artwork(url: str) -> bytes | None:
         return None
 
 
-def _build_result(hit: dict) -> dict:
+def _build_result(hit: dict, collection_id: int | None = None) -> dict:
     """Build a result dict from an iTunes track record."""
     year = None
     release = hit.get("releaseDate", "")
@@ -88,6 +93,7 @@ def _build_result(hit: dict) -> dict:
         "album_artist": hit.get("artistName", ""),
         "track_number": hit.get("trackNumber"),
         "disc_number": hit.get("discNumber"),
+        "collection_id": collection_id or hit.get("collectionId"),
         "artwork_url": artwork_url,
         "artwork_data": _fetch_artwork(artwork_url),
         "artwork_mime": "image/jpeg",
@@ -95,9 +101,32 @@ def _build_result(hit: dict) -> dict:
     }
 
 
-def search(artist: str, title: str, album: str = "") -> dict | None:
+def _find_track_in_collection(collection_id: int, title: str) -> dict | None:
+    """Look up all tracks in a collection and find one matching *title*."""
+    lookup_url = (
+        f"https://itunes.apple.com/lookup"
+        f"?id={collection_id}&entity=song"
+    )
+    lookup_data = _fetch_json(lookup_url)
+    if not lookup_data:
+        return None
+
+    for item in lookup_data.get("results", []):
+        if item.get("wrapperType") != "track":
+            continue
+        if _title_matches(title, item.get("trackName", "")):
+            return _build_result(item, collection_id)
+    return None
+
+
+def search(artist: str, title: str, album: str = "",
+           collection_id: int | None = None) -> dict | None:
     """Search iTunes, album-first strategy.
 
+    If *collection_id* is provided, skips the album search and goes straight
+    to looking up the track in that collection (cache hit from a previous track).
+
+    Otherwise:
     1. Search for the album, find the right collection.
     2. Look up all tracks in that collection.
     3. Match our track by title.
@@ -105,6 +134,12 @@ def search(artist: str, title: str, album: str = "") -> dict | None:
     Falls back to a direct song search if album lookup fails,
     but marks the result so the caller knows it's not album-verified.
     """
+
+    # --- Fast path: cached collection from a previous track ---
+    if collection_id:
+        result = _find_track_in_collection(collection_id, title)
+        if result:
+            return result
 
     # --- Strategy 1: Album-first lookup ---
     if album:
@@ -120,25 +155,12 @@ def search(artist: str, title: str, album: str = "") -> dict | None:
         data = _fetch_json(f"https://itunes.apple.com/search?{params}")
         if data:
             for album_hit in data.get("results", []):
-                collection_id = album_hit.get("collectionId")
-                if not collection_id:
+                cid = album_hit.get("collectionId")
+                if not cid:
                     continue
-
-                # Look up tracks in this collection
-                lookup_url = (
-                    f"https://itunes.apple.com/lookup"
-                    f"?id={collection_id}&entity=song"
-                )
-                lookup_data = _fetch_json(lookup_url)
-                if not lookup_data:
-                    continue
-
-                # Find our track by title
-                for item in lookup_data.get("results", []):
-                    if item.get("wrapperType") != "track":
-                        continue
-                    if _title_matches(title, item.get("trackName", "")):
-                        return _build_result(item)
+                result = _find_track_in_collection(cid, title)
+                if result:
+                    return result
 
     # --- Strategy 2: Direct song search (fallback) ---
     query = f"{artist} {title}".strip()
