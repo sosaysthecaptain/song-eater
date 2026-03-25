@@ -325,6 +325,11 @@ def main(process, device, output, artist, album, threshold, silence_duration, sa
         stashed_audio.clear()
         state.early_id_result = None
         state.expected_duration = 0.0
+        state.meta_album = ""
+        state.meta_track = ""
+        state.meta_disc = ""
+        state.meta_year = ""
+        state.meta_itunes = ""
         state.phase = "waiting"
 
     def _log_failure(metadata: dict, reason: str) -> None:
@@ -593,6 +598,26 @@ def main(process, device, output, artist, album, threshold, silence_duration, sa
                                 state.early_id_result = (
                                     f"{np_result.get('artist', '?')} – {np_result.get('title', '?')}{dur_str}"
                                 )
+                                state.meta_album = np_result.get("album", "")
+
+                        # Update iTunes match status in display
+                        if itunes_lookup and itunes_lookup.done:
+                            if itunes_lookup.result:
+                                enrichment = itunes_lookup.result
+                                if enrichment.get("album_match"):
+                                    state.meta_itunes = "iTunes ✓"
+                                    if enrichment.get("track_number"):
+                                        state.meta_track = str(enrichment["track_number"])
+                                    if enrichment.get("disc_number"):
+                                        state.meta_disc = str(enrichment["disc_number"])
+                                    if enrichment.get("year"):
+                                        state.meta_year = enrichment["year"]
+                                else:
+                                    state.meta_itunes = "iTunes ✗"
+                                    if enrichment.get("year"):
+                                        state.meta_year = enrichment["year"]
+                            else:
+                                state.meta_itunes = "iTunes ✗"
 
                         # Shazam fallback if Now Playing has nothing after 15s
                         if (

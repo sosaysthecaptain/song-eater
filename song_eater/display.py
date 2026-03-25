@@ -44,6 +44,13 @@ class TUIState:
     early_id_result: str | None = None
     expected_duration: float = 0.0   # seconds, from Now Playing
 
+    # Metadata detail line (populated during recording)
+    meta_album: str = ""
+    meta_track: str = ""       # e.g. "3" or "3/12"
+    meta_disc: str = ""
+    meta_year: str = ""
+    meta_itunes: str = ""      # "iTunes ✓" | "iTunes ✗" | ""
+
     completed: list[CompletedTrack] = field(default_factory=list)
     error: str | None = None
     disk_free_gb: float | None = None   # updated periodically by main loop
@@ -254,6 +261,34 @@ def build_renderable(state: TUIState, console: Console | None = None):
     else:
         song_line = Text()
 
+    # Metadata detail line
+    meta_parts = []
+    if state.meta_album:
+        meta_parts.append(("Album: ", "dim"))
+        meta_parts.append((state.meta_album, "white"))
+    if state.meta_track:
+        meta_parts.append(("  Track: ", "dim"))
+        meta_parts.append((state.meta_track, "white"))
+    if state.meta_disc:
+        meta_parts.append(("  Disc: ", "dim"))
+        meta_parts.append((state.meta_disc, "white"))
+    if state.meta_year:
+        meta_parts.append(("  Year: ", "dim"))
+        meta_parts.append((state.meta_year, "white"))
+    if state.meta_itunes:
+        meta_parts.append(("  ", "dim"))
+        if "✓" in state.meta_itunes:
+            meta_parts.append((state.meta_itunes, "green"))
+        else:
+            meta_parts.append((state.meta_itunes, "dim red"))
+    if meta_parts:
+        meta_text = Text()
+        for content, style in meta_parts:
+            meta_text.append(content, style=style)
+        meta_line = Padding(meta_text, (0, 0, 0, 4))
+    else:
+        meta_line = Text()
+
     if state.error:
         err_text = Text()
         err_text.append(f"✗ {state.error}", style="bold red")
@@ -282,6 +317,7 @@ def build_renderable(state: TUIState, console: Console | None = None):
         status,
         Text(""),
         song_line,
+        meta_line,
         error_line,
         disk_line,
         Text(""),
