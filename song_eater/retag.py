@@ -9,8 +9,10 @@ embedded ID3 tags change; files are never renamed. Runs as `song-eater --retag`.
 from __future__ import annotations
 
 import base64
+import hashlib
 import json
 import re
+import time
 from dataclasses import dataclass, field
 from pathlib import Path
 
@@ -19,7 +21,46 @@ from mutagen.id3 import ID3, ID3NoHeaderError
 
 from song_eater import export, itunes, llm, musicbrainz as mb
 
-UNDO_FILE = ".song-eater-undo.json"
+# All song-eater state lives in one hidden folder inside the output dir, so
+# wiping the output folder wipes the state too and a fresh capture starts clean.
+META_DIR = ".song-eater"
+_LEGACY_UNDO = ".song-eater-undo.json"
+
+
+def _meta(folder: Path) -> Path:
+    return folder / META_DIR
+
+
+def _undo_path(folder: Path) -> Path:
+    return _meta(folder) / "undo.json"
+
+
+def _status_path(folder: Path) -> Path:
+    return _meta(folder) / "status.json"
+
+
+def thumbnail_path(folder: Path, mp3_name: str) -> Path:
+    """Where capture stashes the definitive Now-Playing thumbnail for a track."""
+    stem = Path(mp3_name).stem
+    return _meta(folder) / "thumbnails" / f"{stem}.jpg"
+
+
+def _load_status(folder: Path) -> dict:
+    p = _status_path(folder)
+    if p.exists():
+        try:
+            return json.loads(p.read_text())
+        except (OSError, json.JSONDecodeError):
+            pass
+    return {"version": 1, "processed": {}}
+
+
+def _tag_sig(tags: dict) -> str:
+    """Stable signature of the tags we manage, to detect later hand-edits."""
+    key = "|".join(tags.get(k, "") for k in
+                   ("title", "artist", "album", "album_artist", "track", "disc", "year"))
+    return hashlib.sha1(key.encode("utf-8")).hexdigest()[:12]
+
 
 # our tag name -> ID3 frame key
 _FRAMES = {
@@ -448,8 +489,16 @@ def _print_loose_line(pl: FilePlan) -> None:
 # Apply / undo
 # --------------------------------------------------------------------------- #
 
+def _to_retag_updates(d: dict) -> dict:
+    """Rename our tag keys to the names export.retag() expects."""
+    return {("disc_number" if k == "disc" else k): v for k, v in d.items()}
+
+
 def apply_plans(folder: Path, plans: list[FilePlan]) -> int:
     undo: dict = {"version": 1, "entries": {}}
+    status = _load_status(folder)
+    processed = status.setdefault("processed", {})
+    stamp = time.strftime("%Y-%m-%d %H:%M:%S")
     written = 0
     for pl in plans:
         if not pl.changes and not pl.art_change:
@@ -458,19 +507,30 @@ def apply_plans(folder: Path, plans: list[FilePlan]) -> int:
         rel = tf.path.name
         # capture old values for the tags we're about to touch
         entry = {tag: tf.tags.get(tag, "") for tag in pl.changes}
-        updates = {tag: new for tag, (_, new) in pl.changes.items()}
+        updates = _to_retag_updates({tag: new for tag, (_, new) in pl.changes.items()})
         if pl.art_change and pl.match and pl.match.art:
             entry["art_b64"] = _current_art_b64(tf.path)
             updates["artwork_data"] = pl.match.art[0]
             updates["artwork_mime"] = pl.match.art[1]
-        undo["entries"][rel] = entry
         try:
             export.retag(tf.path, updates)
             written += 1
         except Exception as e:
             click.echo(click.style(f"   ! failed on {rel}: {e}", fg="red"), err=True)
+            continue
+        undo["entries"][rel] = entry
+        # Record what this file now looks like, so a rerun can skip it.
+        new_tags = {**tf.tags, **{tag: new for tag, (_, new) in pl.changes.items()}}
+        processed[rel] = {
+            "sig": _tag_sig(new_tags),
+            "album": pl.match.album if pl.match else "",
+            "source": pl.match.source if pl.match else "",
+            "when": stamp,
+        }
     if written:
-        (folder / UNDO_FILE).write_text(json.dumps(undo))
+        _meta(folder).mkdir(parents=True, exist_ok=True)
+        _undo_path(folder).write_text(json.dumps(undo))
+        _status_path(folder).write_text(json.dumps(status, indent=1))
     return written
 
 
@@ -486,17 +546,22 @@ def _current_art_b64(path: Path) -> str | None:
 
 
 def undo_last(folder: Path) -> int:
-    undo_path = folder / UNDO_FILE
+    undo_path = _undo_path(folder)
+    if not undo_path.exists() and (folder / _LEGACY_UNDO).exists():
+        undo_path = folder / _LEGACY_UNDO   # honor undo files from the old location
     if not undo_path.exists():
         click.echo("Nothing to undo here.")
         return 0
     data = json.loads(undo_path.read_text())
+    status = _load_status(folder)
+    processed = status.get("processed", {})
     restored = 0
     for rel, entry in data.get("entries", {}).items():
         p = folder / rel
+        processed.pop(rel, None)   # let a reverted file be reprocessed next run
         if not p.exists():
             continue
-        updates = {tag: val for tag, val in entry.items() if tag != "art_b64"}
+        updates = _to_retag_updates({tag: val for tag, val in entry.items() if tag != "art_b64"})
         strip_art = "art_b64" in entry and not entry["art_b64"]
         if entry.get("art_b64"):
             updates["artwork_data"] = base64.b64decode(entry["art_b64"])
@@ -511,6 +576,8 @@ def undo_last(folder: Path) -> int:
         except Exception:
             pass
     undo_path.unlink(missing_ok=True)
+    if _status_path(folder).exists():
+        _status_path(folder).write_text(json.dumps(status, indent=1))
     return restored
 
 
@@ -519,7 +586,7 @@ def undo_last(folder: Path) -> int:
 # --------------------------------------------------------------------------- #
 
 def run(folder: Path, undo: bool = False, assume_yes: bool = False,
-        dry_run: bool = False, use_ai: bool = True) -> None:
+        dry_run: bool = False, use_ai: bool = True, force: bool = False) -> None:
     folder = folder.resolve()
     if undo:
         n = undo_last(folder)
@@ -531,10 +598,28 @@ def run(folder: Path, undo: bool = False, assume_yes: bool = False,
         click.echo(f"No MP3s in {folder}.")
         return
 
+    # Skip files a previous run already tagged (unchanged since), unless --force.
+    processed = _load_status(folder).get("processed", {})
+    skipped = 0
+    if not force:
+        fresh = []
+        for tf in tracks:
+            rec = processed.get(tf.path.name)
+            if rec and rec.get("sig") == _tag_sig(tf.tags):
+                skipped += 1
+            else:
+                fresh.append(tf)
+        tracks = fresh
+    if not tracks:
+        click.echo(f"All {skipped} files already tagged by song-eater. "
+                   f"Nothing to do (use --force to redo).")
+        return
+
     albums, loose = cluster(tracks)
+    skip_note = f"  ({skipped} already done, skipping)" if skipped else ""
     click.echo(f"Scanning {len(tracks)} files… "
                f"{len(albums)} album group{'s' if len(albums) != 1 else ''}, "
-               f"{len(loose)} loose. Looking up on MusicBrainz…")
+               f"{len(loose)} loose. Looking up on MusicBrainz…{skip_note}")
 
     album_plans: list[tuple[ReleaseMatch, list[FilePlan]]] = []
     still_loose: list[TrackFile] = list(loose)
