@@ -8,19 +8,22 @@ from pathlib import Path
 from mutagen.id3 import APIC, ID3, TALB, TCOM, TDRC, TIT2, TPE1, TPE2, TPOS, TRCK
 
 
-def save_track(wav_path: str, metadata: dict, output_dir: Path) -> Path:
-    """Convert WAV to tagged MP3 and save to output_dir. Returns the MP3 path."""
+def save_track(wav_path: str, metadata: dict, output_dir: Path) -> Path | None:
+    """Convert WAV to tagged MP3 and save to output_dir. Returns the MP3 path,
+    or ``None`` if a track with this name already exists in the folder.
+
+    We intentionally do NOT save a "(2)" duplicate: that only happens when a
+    playlist loops (e.g. left running overnight) and starts repeating songs
+    we've already captured. Skipping keeps the folder to one copy per song.
+    """
     artist = metadata.get("artist", "Unknown")
     title = metadata.get("title", "Unknown")
     filename = _sanitize(f"{artist} - {title}.mp3")
     mp3_path = output_dir / filename
 
-    # Handle duplicate filenames
-    counter = 1
-    while mp3_path.exists():
-        counter += 1
-        filename = _sanitize(f"{artist} - {title} ({counter}).mp3")
-        mp3_path = output_dir / filename
+    # Already have this song — discard rather than saving a duplicate.
+    if mp3_path.exists():
+        return None
 
     # Convert WAV to MP3 via ffmpeg
     subprocess.run(
