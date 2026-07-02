@@ -56,7 +56,9 @@ song-eater --retag --undo
 
 Retag groups the files into albums (plus loose singles), looks each up on MusicBrainz **and** iTunes, and picks the release that best explains the whole folder — **preferring the original studio album over compilations/live/greatest-hits, but the unified deluxe edition when the folder includes bonus tracks.** It fixes album, track/disc numbers, year, and cover art. It prints a plan and asks before writing; **only embedded tags change, files are never renamed.** The last run is reversible with `--retag --undo`.
 
-State lives in a hidden `.song-eater/` folder inside the target directory (undo history + which files are already tagged), so a rerun **skips files it already handled** — use `--force` to redo them. Wiping the folder resets everything. A local `claude` CLI, if present, is used only to break ties on ambiguous albums (`--no-ai` to disable); it's never required.
+If a local `claude` CLI is present, it does the **grouping** for the whole folder — deciding which songs form an album, folding in stragglers whose album tag is missing, and unifying standard/deluxe editions (e.g. pulling `logical` into `GUTS (spilled)`). Track numbers and art still come from real releases (MusicBrainz/iTunes), never the model, so the AI groups but never invents data. `--no-ai` disables it and falls back to grouping by the album tag; it's never required.
+
+State lives in a hidden `.song-eater/` folder inside the target directory (undo history + which files are already tagged), so a rerun **skips files it already handled** — use `--force` to redo them. Wiping the folder resets everything.
 
 ## Keyboard controls
 

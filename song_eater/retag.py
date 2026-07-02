@@ -222,12 +222,15 @@ def _score(cand: Candidate, folder_titles: set) -> tuple[float, float]:
     return coverage, coverage * cand.type_weight + year_bonus
 
 
-def resolve_album(files: list[TrackFile], use_ai: bool = True) -> ReleaseMatch | None:
+def resolve_album(files: list[TrackFile], use_ai: bool = True,
+                  album_hint: str | None = None) -> ReleaseMatch | None:
     folder_titles = {norm(f.tags["title"]) for f in files if f.tags["title"]}
     if not folder_titles:
         return None
     artist = _primary_artist(files[0])
-    album = clean_album(files[0].tags["album"])
+    # Prefer the AI's grouped album name (it unifies editions / folds orphans);
+    # fall back to the files' own album tag.
+    album = clean_album(album_hint or files[0].tags["album"])
     candidates = [c for c in _mb_candidates(artist, album) + _itunes_candidates(artist, album)
                   if c.tracklist]
     if not candidates:
@@ -286,10 +289,30 @@ def _ai_pick(folder_titles: set, candidates: list[Candidate]) -> Candidate | Non
     return None
 
 
-def resolve_single(tf: TrackFile) -> ReleaseMatch | None:
+def resolve_single(tf: TrackFile, album_hint: str | None = None) -> ReleaseMatch | None:
     title, artist = tf.tags["title"], _primary_artist(tf)
     if not title or not artist:
         return None
+    nt = norm(title)
+
+    # Grounded path: if we know the album (the AI group label, else the file's
+    # own tag), look THAT album up and find the track in it. Avoids bare-search
+    # mismatches like "TWICE – TT" ranking a soundtrack cover first.
+    hint = album_hint or tf.tags["album"]
+    if hint and norm(clean_album(hint)) not in ("", "unknown"):
+        for a in itunes.album_candidates(artist, clean_album(hint), limit=4):
+            pos = next(((d, p, t) for d, p, t in a["tracklist"] if _sim(nt, norm(t)) >= 0.7), None)
+            if not pos:
+                continue
+            art = None
+            if a["artwork_url"]:
+                b = itunes._fetch_artwork(a["artwork_url"])
+                if b:
+                    art = (b, "image/jpeg", len(b))
+            return ReleaseMatch(
+                album=a["album"], album_artist=a["album_artist"] or tf.tags["artist"],
+                year=a["year"], mbid="", tracklist=[(pos[0], pos[1], title)],
+                confidence="confident", art=art, source="itunes")
 
     # iTunes reliably maps a mainstream song to its canonical home album
     # (album + track number + high-res art in one call) — better than MB for
@@ -311,7 +334,6 @@ def resolve_single(tf: TrackFile) -> ReleaseMatch | None:
         )
 
     # MB fallback: best title-matching recording, then its release-groups.
-    nt = norm(title)
     recs = [r for r in mb.search_recordings(artist, title)
             if _sim(nt, norm(r.get("title", ""))) >= 0.6]
     if not recs:
@@ -637,18 +659,33 @@ def run(folder: Path, undo: bool = False, assume_yes: bool = False,
                    f"Nothing to do (use --force to redo).")
         return
 
-    albums, loose = cluster(tracks)
+    # Group into albums. With AI, Claude groups the whole folder (folding orphans,
+    # unifying editions); otherwise fall back to grouping by the album tag.
+    ai_on = use_ai and llm.available()
+    if ai_on:
+        click.echo("AI assist: on (local claude) — grouping the folder…")
+    groups = ai_group(tracks) if ai_on else None
+    if groups:
+        by_album: dict[str, list[TrackFile]] = {}
+        for tf in tracks:
+            by_album.setdefault(groups.get(tf.path.name) or f"\0{tf.path.name}", []).append(tf)
+        albums = [(label, files) for label, files in by_album.items()
+                  if len(files) >= 2 and not label.startswith("\0")]
+        loose = [f for label, files in by_album.items()
+                 if len(files) < 2 or label.startswith("\0") for f in files]
+    else:
+        raw_albums, loose = cluster(tracks)
+        albums = [(None, files) for files in raw_albums]
+
     skip_note = f"  ({skipped} already done, skipping)" if skipped else ""
     click.echo(f"Scanning {len(tracks)} files… "
-               f"{len(albums)} album group{'s' if len(albums) != 1 else ''}, "
-               f"{len(loose)} loose. Looking up on MusicBrainz…{skip_note}")
+               f"{len(albums)} album{'s' if len(albums) != 1 else ''}, "
+               f"{len(loose)} loose. Looking up releases…{skip_note}")
 
     album_plans: list[tuple[ReleaseMatch, list[FilePlan]]] = []
     still_loose: list[TrackFile] = list(loose)
-    if use_ai and llm.available():
-        click.echo("AI assist: on (local claude)")
-    for files in albums:
-        match = resolve_album(files, use_ai=use_ai)
+    for hint, files in albums:
+        match = resolve_album(files, use_ai=use_ai, album_hint=hint)
         if not match:
             still_loose.extend(files)   # couldn't nail it — treat as singles
             continue
@@ -671,7 +708,7 @@ def run(folder: Path, undo: bool = False, assume_yes: bool = False,
 
     loose_plans: list[FilePlan] = []
     for tf in still_loose:
-        match = resolve_single(tf)
+        match = resolve_single(tf, album_hint=(groups or {}).get(tf.path.name))
         if match:
             fetch_art(match)
             pos = match.tracklist[0] if match.tracklist else None
@@ -691,6 +728,49 @@ def run(folder: Path, undo: bool = False, assume_yes: bool = False,
         return
     written = apply_plans(folder, all_plans)
     click.echo(f"Updated {written} files. Undo with:  song-eater --retag --undo")
+
+
+def ai_group(tracks: list[TrackFile]) -> dict | None:
+    """Use the local model to group the folder into albums — folding in orphans
+    whose album tag is missing, and unifying standard/deluxe editions. Returns
+    {filename: canonical_album_label}, or None if AI is unavailable.
+
+    Grouping ONLY — track numbers still come from real tracklists downstream,
+    since the model groups well but mis-numbers.
+    """
+    if not llm.available():
+        return None
+    rows = []
+    for tf in tracks:
+        t = tf.tags
+        cand = itunes.search(t["artist"] or "", t["title"] or "", "")
+        rows.append({
+            "file": tf.path.name,
+            "artist": t["artist"], "title": t["title"], "album_tag": t["album"],
+            "itunes_album": (cand or {}).get("album"),
+        })
+    prompt = (
+        "Group a folder of song files into the albums they belong to. For each "
+        "file you get its tags and an iTunes album guess.\n"
+        "Rules:\n"
+        "- Use ONE canonical album name per album. If songs span a standard + "
+        "deluxe edition, use the edition that contains them all (e.g. 'GUTS (spilled)').\n"
+        "- A song whose album tag is missing/Unknown but that clearly belongs to "
+        "an album otherwise present in this folder MUST get that album's name.\n"
+        "- Prefer the original studio album over compilations/live/greatest-hits.\n"
+        "- A standalone single keeps its own single/EP name.\n"
+        "- Do NOT include track numbers — only the album name per file.\n"
+        'Return ONLY a JSON array; one object per file: {"file":..,"album":..}.\n\n'
+        "FILES:\n" + json.dumps(rows, ensure_ascii=False)
+    )
+    res = llm.judge_json(prompt, timeout=180)
+    if not isinstance(res, list):
+        return None
+    out = {}
+    for r in res:
+        if isinstance(r, dict) and r.get("file") and r.get("album"):
+            out[r["file"]] = str(r["album"])
+    return out or None
 
 
 def cluster(tracks: list[TrackFile]) -> tuple[list[list[TrackFile]], list[TrackFile]]:
