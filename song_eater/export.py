@@ -71,6 +71,10 @@ def retag(mp3_path: Path, updates: dict) -> None:
     artwork_data, artwork_mime.
     """
     tags = ID3(str(mp3_path))
+    if "album" in updates:
+        tags.add(TALB(encoding=3, text=updates["album"]))
+    if "title" in updates:
+        tags.add(TIT2(encoding=3, text=updates["title"]))
     if "track" in updates:
         tags.add(TRCK(encoding=3, text=str(updates["track"])))
     if "disc_number" in updates:

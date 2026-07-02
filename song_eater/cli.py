@@ -187,11 +187,21 @@ Record audio from any app, split tracks on silence, identify via macOS Now
 Playing (or Shazam fallback), and save as tagged MP3s.
 
 \b
+RETAG mode (--retag) cleans up MP3s already in a folder: it groups them into
+albums (plus loose singles), looks each up on MusicBrainz — preferring the
+original studio album over compilations — and fixes album, track/disc numbers,
+year, and cover art. Only embedded tags change; files are never renamed. It
+shows a plan and asks before writing; revert the last run with --retag --undo.
+
+\b
 Examples:
   song-eater                             Capture from Chrome (default)
   song-eater -p Spotify                  Capture from Spotify
   song-eater -p Chrome -o ~/Music        Save MP3s to ~/Music
   song-eater -a "Pink Floyd" -A "DSOTM"  Manual mode (skip identification)
+  song-eater --retag                     Fix the tags of MP3s in this folder
+  song-eater --retag ~/Music/mix         Fix the tags in a specific folder
+  song-eater --retag --undo              Undo the last retag here
 
 \b
 Keyboard controls (during capture):
@@ -237,7 +247,24 @@ Keyboard controls (during capture):
     help="Sample rate in Hz.",
     show_default=True,
 )
-def main(process, device, output, artist, album, threshold, silence_duration, sample_rate):
+@click.option(
+    "--retag", "retag_mode", is_flag=True, default=False,
+    help="Retag mode: fix tags of the MP3s in FOLDER (default: current dir). "
+         "Shows a plan and asks before writing; only embedded tags change.",
+)
+@click.option(
+    "--undo", is_flag=True, default=False,
+    help="With --retag: revert the last retag on FOLDER.",
+)
+@click.argument("folder", type=click.Path(path_type=Path), required=False)
+def main(process, device, output, artist, album, threshold, silence_duration,
+         sample_rate, retag_mode, undo, folder):
+    # --- Retag mode: clean up an existing folder, then exit ---
+    if retag_mode:
+        from song_eater import retag
+        retag.run(folder or Path.cwd(), undo=undo)
+        return
+
     if output is None:
         output = Path.cwd()
     output.mkdir(parents=True, exist_ok=True)

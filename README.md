@@ -43,6 +43,19 @@ Start playing music, then run `song-eater`. It captures audio, splits on silence
 
 The first time you run it, macOS will ask for **Screen & System Audio Recording** permission for your terminal app.
 
+## Fixing tags after the fact
+
+```bash
+# Clean up the tags of MP3s already in a folder
+song-eater --retag              # current folder
+song-eater --retag ~/Music/mix  # a specific folder
+
+# Revert the last retag
+song-eater --retag --undo
+```
+
+Retag groups the files into albums (plus loose singles), looks each up on MusicBrainz — **preferring the original studio album over compilations, live records, and greatest-hits** — and fixes album, track/disc numbers, year, and cover art. Loose singles are resolved via iTunes to their canonical album. It prints a plan and asks before writing; **only embedded tags change, files are never renamed.** The last run is reversible with `--retag --undo`.
+
 ## Keyboard controls
 
 | Key | Action |
