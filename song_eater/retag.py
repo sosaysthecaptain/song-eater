@@ -672,6 +672,24 @@ def run(folder: Path, undo: bool = False, assume_yes: bool = False,
         else:
             loose_plans.append(FilePlan(file=tf, match=None, pos=None))
 
+    # Promote loose songs that resolved to the SAME album into an ordered album
+    # group. Claude sometimes scatters an album's tracks as singles; if they all
+    # land on one release, they're an album — show them together, in order.
+    by_resolved: dict[tuple, list[FilePlan]] = {}
+    singles: list[FilePlan] = []
+    for pl in loose_plans:
+        if pl.match and pl.match.confidence == "confident" and pl.pos:
+            by_resolved.setdefault(
+                (norm(pl.match.album_artist), norm(pl.match.album)), []).append(pl)
+        else:
+            singles.append(pl)
+    loose_plans = list(singles)
+    for group in by_resolved.values():
+        if len(group) >= 2:
+            album_plans.append((group[0].match, group))
+        else:
+            loose_plans.extend(group)
+
     n_changed = print_report(album_plans, loose_plans)
     all_plans = [pl for _, plans in album_plans for pl in plans] + loose_plans
     click.echo(click.style(
