@@ -19,7 +19,7 @@ from pathlib import Path
 import click
 from mutagen.id3 import ID3, ID3NoHeaderError
 
-from song_eater import export, itunes, llm, musicbrainz as mb
+from song_eater import art, export, itunes, llm, musicbrainz as mb
 
 # All song-eater state lives in one hidden folder inside the output dir, so
 # wiping the output folder wipes the state too and a fresh capture starts clean.
@@ -397,7 +397,8 @@ class FilePlan:
     art_change: tuple | None = None   # (old_len, new_len) or None
 
 
-def _plan_file(tf: TrackFile, match: ReleaseMatch | None, pos: tuple | None) -> FilePlan:
+def _plan_file(tf: TrackFile, match: ReleaseMatch | None, pos: tuple | None,
+               allow_art: bool = True) -> FilePlan:
     plan = FilePlan(file=tf, match=match, pos=pos)
     if match is None or match.confidence == "weak":
         return plan  # leave weak / unmatched files untouched
@@ -412,9 +413,30 @@ def _plan_file(tf: TrackFile, match: ReleaseMatch | None, pos: tuple | None) -> 
     for tag, val in new.items():
         if val and val != tf.tags.get(tag, ""):
             plan.changes[tag] = (tf.tags.get(tag, ""), val)
-    if match.art and match.art[2] > tf.art_len:   # only ever upgrade resolution
+    if allow_art and match.art:
         plan.art_change = (tf.art_len, match.art[2])
     return plan
+
+
+def _verify_art(folder: Path, tf: TrackFile, match: ReleaseMatch | None) -> bool:
+    """Decide whether to apply match.art to this file.
+
+    If capture stashed the definitive Now-Playing thumbnail, the candidate must
+    be a perceptual match to it — so we only ever upgrade to a bigger copy of
+    the cover we know is correct, never a plausible-but-wrong one. Without a
+    thumbnail (files predating that), fall back to size-only upgrade.
+    """
+    if not match or not match.art or match.art[2] <= tf.art_len:
+        return False  # nothing to apply, or would not be an upgrade
+    thumb = thumbnail_path(folder, tf.path.name)
+    if thumb.exists() and art.available():
+        try:
+            ref = thumb.read_bytes()
+        except OSError:
+            ref = None
+        if ref:
+            return art.same_cover(ref, match.art[0])
+    return True
 
 
 # --------------------------------------------------------------------------- #
@@ -636,7 +658,7 @@ def run(folder: Path, undo: bool = False, assume_yes: bool = False,
         for f in files:
             pos = posmap.get(f.path)
             if pos:
-                plans.append(_plan_file(f, match, pos))
+                plans.append(_plan_file(f, match, pos, allow_art=_verify_art(folder, f, match)))
             else:
                 # This edition doesn't contain the track — leave it untouched
                 # and flag it, rather than half-tagging (album but no number).
@@ -653,7 +675,7 @@ def run(folder: Path, undo: bool = False, assume_yes: bool = False,
         if match:
             fetch_art(match)
             pos = match.tracklist[0] if match.tracklist else None
-            loose_plans.append(_plan_file(tf, match, pos))
+            loose_plans.append(_plan_file(tf, match, pos, allow_art=_verify_art(folder, tf, match)))
         else:
             loose_plans.append(FilePlan(file=tf, match=None, pos=None))
 

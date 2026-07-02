@@ -58,6 +58,22 @@ def _disk_free_gb(path: Path) -> float:
     return (st.f_bavail * st.f_frsize) / (1024 ** 3)
 
 
+def _stash_thumbnail(output: Path, mp3_name: str, np_metadata: dict | None) -> None:
+    """Save the definitive Now-Playing thumbnail as the trusted art reference
+    for a later `--retag` upgrade. Kept separate from the (better) art we embed,
+    so it never compromises it."""
+    thumb = (np_metadata or {}).get("artwork_data")
+    if not thumb:
+        return
+    try:
+        from song_eater import retag
+        tp = retag.thumbnail_path(output, mp3_name)
+        tp.parent.mkdir(parents=True, exist_ok=True)
+        tp.write_bytes(thumb)
+    except OSError:
+        pass
+
+
 # ---------------------------------------------------------------------------
 # Non-blocking keyboard input
 # ---------------------------------------------------------------------------
@@ -594,6 +610,7 @@ def main(process, device, output, artist, album, threshold, silence_duration,
                     album=metadata.get("album", ""),
                     itunes_matched=bool(metadata.get("_itunes_matched")),
                 ))
+                _stash_thumbnail(output, mp3_path.name, np_metadata)
             state.scroll_pinned = True
         except Exception as e:
             state.error = f"Export failed: {e}"
