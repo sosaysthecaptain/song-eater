@@ -9,10 +9,8 @@ embedded ID3 tags change; files are never renamed. Runs as `song-eater --retag`.
 from __future__ import annotations
 
 import base64
-import hashlib
 import json
 import re
-import time
 from dataclasses import dataclass, field
 from pathlib import Path
 
@@ -35,31 +33,10 @@ def _undo_path(folder: Path) -> Path:
     return _meta(folder) / "undo.json"
 
 
-def _status_path(folder: Path) -> Path:
-    return _meta(folder) / "status.json"
-
-
 def thumbnail_path(folder: Path, mp3_name: str) -> Path:
     """Where capture stashes the definitive Now-Playing thumbnail for a track."""
     stem = Path(mp3_name).stem
     return _meta(folder) / "thumbnails" / f"{stem}.jpg"
-
-
-def _load_status(folder: Path) -> dict:
-    p = _status_path(folder)
-    if p.exists():
-        try:
-            return json.loads(p.read_text())
-        except (OSError, json.JSONDecodeError):
-            pass
-    return {"version": 1, "processed": {}}
-
-
-def _tag_sig(tags: dict) -> str:
-    """Stable signature of the tags we manage, to detect later hand-edits."""
-    key = "|".join(tags.get(k, "") for k in
-                   ("title", "artist", "album", "album_artist", "track", "disc", "year"))
-    return hashlib.sha1(key.encode("utf-8")).hexdigest()[:12]
 
 
 # our tag name -> ID3 frame key
@@ -479,10 +456,15 @@ def print_report(album_plans: list[tuple[ReleaseMatch, list[FilePlan]]],
         click.echo(click.style(f"\n{head}", bold=True) +
                    click.style(f"   [{src} · {match.confidence}]",
                                fg="yellow" if partial else "bright_black"))
-        if any(pl.art_change for pl in plans):
-            click.echo("   " + click.style(f"art → {match.art[2] // 1024}KB", fg="green"))
-        for pl in plans:
-            _print_file_line(pl)
+        n_ch = sum(1 for pl in plans if pl.changes or pl.art_change)
+        summary = f"{len(plans)} tracks · {len(plans) - n_ch} already correct"
+        if n_ch:
+            summary += f", {n_ch} updated"
+        art_note = f" · art → {match.art[2] // 1024}KB" if any(pl.art_change for pl in plans) else ""
+        click.echo("   " + click.style(summary + art_note, fg="bright_black"))
+        # Show the album as a real tracklist, in order.
+        for pl in sorted(plans, key=lambda p: (p.pos[0], p.pos[1]) if p.pos else (99, 999)):
+            _print_album_line(pl)
             if pl.changes or pl.art_change:
                 n_changed += 1
     if loose_plans:
@@ -494,26 +476,28 @@ def print_report(album_plans: list[tuple[ReleaseMatch, list[FilePlan]]],
     return n_changed
 
 
-def _print_file_line(pl: FilePlan) -> None:
+def _print_album_line(pl: FilePlan) -> None:
+    """One track line: green = already correct, yellow = being relabeled."""
     tf = pl.file
     title = tf.tags["title"] or tf.path.name
-    if pl.match and pl.pos is None:   # couldn't place in this edition
-        click.echo(click.style(f"    –   {title}", fg="yellow")
-                   + click.style("   couldn't place — bonus/deluxe edition? left as-is",
-                                 fg="bright_black"))
+    if pl.match and pl.pos is None:   # not on this edition
+        click.echo(click.style(f"    ·  {title}", fg="yellow")
+                   + click.style("   not on this edition — left as-is", fg="bright_black"))
         return
+    num = pl.pos[1] if pl.pos else (pl.changes["track"][1] if "track" in pl.changes else "?")
+    numstr = f"{num:>2}"
     if not pl.changes and not pl.art_change:
-        click.echo(click.style(f"   ok   {title}", fg="bright_black"))
+        click.echo(click.style(f"   {numstr}  {title}", fg="green"))
         return
-    num = pl.changes.get("track")
-    numstr = f"#{num[1]:>2}" if num else (f"#{pl.pos[1]:>2}" if pl.pos else "  ?")
     detail = []
     if "track" in pl.changes:
         detail.append(f"track {pl.changes['track'][0] or '—'}→{pl.changes['track'][1]}")
     if "album" in pl.changes:
-        detail.append(f'album "{pl.changes["album"][1]}"')
-    click.echo(f"   {click.style(numstr, fg='yellow')}  {title}"
-               + (f"   {click.style(', '.join(detail), fg='bright_black')}" if detail else ""))
+        detail.append(f'→ "{pl.changes["album"][1]}"')
+    if pl.art_change:
+        detail.append("art↑")
+    tail = f"   {click.style(', '.join(detail), fg='bright_black')}" if detail else ""
+    click.echo(click.style(f"   {numstr}  {title}", fg="yellow") + tail)
 
 
 def _print_loose_line(pl: FilePlan) -> None:
@@ -540,9 +524,6 @@ def _to_retag_updates(d: dict) -> dict:
 
 def apply_plans(folder: Path, plans: list[FilePlan]) -> int:
     undo: dict = {"version": 1, "entries": {}}
-    status = _load_status(folder)
-    processed = status.setdefault("processed", {})
-    stamp = time.strftime("%Y-%m-%d %H:%M:%S")
     written = 0
     for pl in plans:
         if not pl.changes and not pl.art_change:
@@ -563,18 +544,9 @@ def apply_plans(folder: Path, plans: list[FilePlan]) -> int:
             click.echo(click.style(f"   ! failed on {rel}: {e}", fg="red"), err=True)
             continue
         undo["entries"][rel] = entry
-        # Record what this file now looks like, so a rerun can skip it.
-        new_tags = {**tf.tags, **{tag: new for tag, (_, new) in pl.changes.items()}}
-        processed[rel] = {
-            "sig": _tag_sig(new_tags),
-            "album": pl.match.album if pl.match else "",
-            "source": pl.match.source if pl.match else "",
-            "when": stamp,
-        }
     if written:
         _meta(folder).mkdir(parents=True, exist_ok=True)
         _undo_path(folder).write_text(json.dumps(undo))
-        _status_path(folder).write_text(json.dumps(status, indent=1))
     return written
 
 
@@ -597,12 +569,9 @@ def undo_last(folder: Path) -> int:
         click.echo("Nothing to undo here.")
         return 0
     data = json.loads(undo_path.read_text())
-    status = _load_status(folder)
-    processed = status.get("processed", {})
     restored = 0
     for rel, entry in data.get("entries", {}).items():
         p = folder / rel
-        processed.pop(rel, None)   # let a reverted file be reprocessed next run
         if not p.exists():
             continue
         updates = _to_retag_updates({tag: val for tag, val in entry.items() if tag != "art_b64"})
@@ -620,8 +589,6 @@ def undo_last(folder: Path) -> int:
         except Exception:
             pass
     undo_path.unlink(missing_ok=True)
-    if _status_path(folder).exists():
-        _status_path(folder).write_text(json.dumps(status, indent=1))
     return restored
 
 
@@ -630,7 +597,7 @@ def undo_last(folder: Path) -> int:
 # --------------------------------------------------------------------------- #
 
 def run(folder: Path, undo: bool = False, assume_yes: bool = False,
-        dry_run: bool = False, use_ai: bool = True, force: bool = False) -> None:
+        dry_run: bool = False, use_ai: bool = True) -> None:
     folder = folder.resolve()
     if undo:
         n = undo_last(folder)
@@ -640,23 +607,6 @@ def run(folder: Path, undo: bool = False, assume_yes: bool = False,
     tracks = scan_folder(folder)
     if not tracks:
         click.echo(f"No MP3s in {folder}.")
-        return
-
-    # Skip files a previous run already tagged (unchanged since), unless --force.
-    processed = _load_status(folder).get("processed", {})
-    skipped = 0
-    if not force:
-        fresh = []
-        for tf in tracks:
-            rec = processed.get(tf.path.name)
-            if rec and rec.get("sig") == _tag_sig(tf.tags):
-                skipped += 1
-            else:
-                fresh.append(tf)
-        tracks = fresh
-    if not tracks:
-        click.echo(f"All {skipped} files already tagged by song-eater. "
-                   f"Nothing to do (use --force to redo).")
         return
 
     # Group into albums. With AI, Claude groups the whole folder (folding orphans,
@@ -677,10 +627,9 @@ def run(folder: Path, undo: bool = False, assume_yes: bool = False,
         raw_albums, loose = cluster(tracks)
         albums = [(None, files) for files in raw_albums]
 
-    skip_note = f"  ({skipped} already done, skipping)" if skipped else ""
     click.echo(f"Scanning {len(tracks)} files… "
                f"{len(albums)} album{'s' if len(albums) != 1 else ''}, "
-               f"{len(loose)} loose. Looking up releases…{skip_note}")
+               f"{len(loose)} loose. Looking up releases…")
 
     album_plans: list[tuple[ReleaseMatch, list[FilePlan]]] = []
     still_loose: list[TrackFile] = list(loose)
