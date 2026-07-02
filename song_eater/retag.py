@@ -17,7 +17,7 @@ from pathlib import Path
 import click
 from mutagen.id3 import ID3, ID3NoHeaderError
 
-from song_eater import export, itunes, musicbrainz as mb
+from song_eater import export, itunes, llm, musicbrainz as mb
 
 UNDO_FILE = ".song-eater-undo.json"
 
@@ -130,6 +130,7 @@ class ReleaseMatch:
     tracklist: list          # [(disc, pos, title)]
     confidence: str          # "confident" | "weak"
     art: tuple | None = None  # (bytes, mime, length)
+    source: str = "musicbrainz"
 
 
 def _primary_artist(tf: TrackFile) -> str:
@@ -137,41 +138,111 @@ def _primary_artist(tf: TrackFile) -> str:
     return a.split(",")[0].strip()
 
 
-def resolve_album(files: list[TrackFile]) -> ReleaseMatch | None:
-    titles = {norm(f.tags["title"]) for f in files if f.tags["title"]}
-    if not titles:
-        return None
-    artist = _primary_artist(files[0])
-    album = clean_album(files[0].tags["album"])
-    best = None
-    best_score = 0.0
+@dataclass
+class Candidate:
+    source: str                 # "musicbrainz" | "itunes"
+    album: str
+    album_artist: str
+    year: str
+    tracklist: list             # [(disc, pos, title)]
+    type_weight: float          # penalty for comps/live etc.
+    mbid: str = ""
+    art_url: str = ""
+
+
+def _mb_candidates(artist: str, album: str) -> list[Candidate]:
+    out = []
     for rg in mb.search_release_groups(artist, album)[:6]:
         primary, secondary = mb.release_group_kind(rg)
         tracklist, _ = mb.release_group_tracklist(rg["id"])
         if not tracklist:
             continue
-        rg_titles = {norm(t) for _, _, t in tracklist}
-        coverage = len(titles & rg_titles) / len(titles)
-        if coverage == 0:
-            continue
-        year = mb.first_year(rg)
-        date_bonus = (1 - min(int(year), 3000) / 3000) * 0.05 if year else 0
-        score = coverage * _type_weight(primary, secondary) + date_bonus
-        if score > best_score:
-            best_score = score
-            best = (rg, tracklist, coverage)
-    if not best or best[2] < 0.5:
+        out.append(Candidate(
+            "musicbrainz", rg.get("title", album),
+            (rg.get("artist-credit") or [{}])[0].get("name", artist),
+            mb.first_year(rg), tracklist, _type_weight(primary, secondary), mbid=rg["id"]))
+    return out
+
+
+def _itunes_candidates(artist: str, album: str) -> list[Candidate]:
+    out = []
+    for a in itunes.album_candidates(artist, album):
+        out.append(Candidate(
+            "itunes", a["album"], a["album_artist"], a["year"], a["tracklist"],
+            0.4 if a["is_comp"] else 0.9,   # slightly below MB Album so MB originals win ties
+            art_url=a["artwork_url"]))
+    return out
+
+
+def _score(cand: Candidate, folder_titles: set) -> tuple[float, float]:
+    titles = {norm(t) for _, _, t in cand.tracklist}
+    coverage = len(folder_titles & titles) / len(folder_titles) if folder_titles else 0.0
+    year_bonus = (1 - min(int(cand.year or 3000), 3000) / 3000) * 0.05 if cand.year else 0
+    return coverage, coverage * cand.type_weight + year_bonus
+
+
+def resolve_album(files: list[TrackFile], use_ai: bool = True) -> ReleaseMatch | None:
+    folder_titles = {norm(f.tags["title"]) for f in files if f.tags["title"]}
+    if not folder_titles:
         return None
-    rg, tracklist, coverage = best
-    credit = (rg.get("artist-credit") or [{}])[0].get("name", artist)
+    artist = _primary_artist(files[0])
+    album = clean_album(files[0].tags["album"])
+    candidates = [c for c in _mb_candidates(artist, album) + _itunes_candidates(artist, album)
+                  if c.tracklist]
+    if not candidates:
+        return None
+
+    scored = sorted(((_score(c, folder_titles), c) for c in candidates), key=lambda x: -x[0][1])
+    (best_cov, best_score), best = scored[0]
+    if best_cov < 0.5:
+        return None
+
+    # AI tie-break: only when the top match is partial or a close call, and only
+    # to CHOOSE among real candidates we fetched (numbers still come from data).
+    if use_ai and llm.available():
+        runner = scored[1][0][1] if len(scored) > 1 else 0.0
+        if best_cov < 1.0 or (runner and best_score - runner < 0.1):
+            picked = _ai_pick(folder_titles, [c for _, c in scored[:5]])
+            if picked is not None:
+                best = picked
+
+    return _match_from_candidate(best, artist)
+
+
+def _match_from_candidate(c: Candidate, artist: str) -> ReleaseMatch:
+    art = None
+    if c.source == "itunes" and c.art_url:
+        b = itunes._fetch_artwork(c.art_url)
+        if b:
+            art = (b, "image/jpeg", len(b))
     return ReleaseMatch(
-        album=rg.get("title", album),
-        album_artist=credit,
-        year=mb.first_year(rg),
-        mbid=rg["id"],
-        tracklist=tracklist,
-        confidence="confident",  # refined by completeness in run()
+        album=c.album, album_artist=c.album_artist or artist, year=c.year,
+        mbid=c.mbid, tracklist=c.tracklist, confidence="confident", art=art, source=c.source)
+
+
+def _ai_pick(folder_titles: set, candidates: list[Candidate]) -> Candidate | None:
+    """Ask the local model which candidate release best explains the folder.
+    Returns a candidate only if the model is confident; else None (fall back)."""
+    lines = []
+    for i, c in enumerate(candidates):
+        tl = ", ".join(t for _, _, t in c.tracklist)
+        lines.append(f"[{i}] {c.source}: \"{c.album}\" ({c.year or '?'}, {len(c.tracklist)} tracks): {tl}")
+    prompt = (
+        "You are matching a folder of song files to the correct album release.\n"
+        f"Folder song titles: {sorted(folder_titles)}\n\n"
+        "Candidate releases:\n" + "\n".join(lines) + "\n\n"
+        "Pick the ONE release that best explains ALL the folder songs — prefer the "
+        "edition that contains every song (e.g. a deluxe) and, when songs also "
+        "appear on compilations, prefer the original studio album.\n"
+        "Return ONLY compact JSON: {\"index\": <int>, \"confidence\": <0..1>}."
     )
+    result = llm.judge_json(prompt)
+    if not isinstance(result, dict):
+        return None
+    idx, conf = result.get("index"), result.get("confidence", 0)
+    if isinstance(idx, int) and 0 <= idx < len(candidates) and conf and conf >= 0.7:
+        return candidates[idx]
+    return None
 
 
 def resolve_single(tf: TrackFile) -> ReleaseMatch | None:
@@ -195,6 +266,7 @@ def resolve_single(tf: TrackFile) -> ReleaseMatch | None:
             tracklist=[(int(r.get("disc_number") or 1), int(r["track_number"]), title)],
             confidence="confident",
             art=art,
+            source="itunes",
         )
 
     # MB fallback: best title-matching recording, then its release-groups.
@@ -318,8 +390,9 @@ def print_report(album_plans: list[tuple[ReleaseMatch, list[FilePlan]]],
         if match.year:
             head += f" ({match.year})"
         partial = match.confidence.startswith("partial")
+        src = {"itunes": "iTunes", "musicbrainz": "MusicBrainz"}.get(match.source, match.source)
         click.echo(click.style(f"\n{head}", bold=True) +
-                   click.style(f"   [MusicBrainz · {match.confidence}]",
+                   click.style(f"   [{src} · {match.confidence}]",
                                fg="yellow" if partial else "bright_black"))
         if any(pl.art_change for pl in plans):
             click.echo("   " + click.style(f"art → {match.art[2] // 1024}KB", fg="green"))
@@ -446,7 +519,7 @@ def undo_last(folder: Path) -> int:
 # --------------------------------------------------------------------------- #
 
 def run(folder: Path, undo: bool = False, assume_yes: bool = False,
-        dry_run: bool = False) -> None:
+        dry_run: bool = False, use_ai: bool = True) -> None:
     folder = folder.resolve()
     if undo:
         n = undo_last(folder)
@@ -465,8 +538,10 @@ def run(folder: Path, undo: bool = False, assume_yes: bool = False,
 
     album_plans: list[tuple[ReleaseMatch, list[FilePlan]]] = []
     still_loose: list[TrackFile] = list(loose)
+    if use_ai and llm.available():
+        click.echo("AI assist: on (local claude)")
     for files in albums:
-        match = resolve_album(files)
+        match = resolve_album(files, use_ai=use_ai)
         if not match:
             still_loose.extend(files)   # couldn't nail it — treat as singles
             continue

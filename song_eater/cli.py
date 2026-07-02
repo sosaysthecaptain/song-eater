@@ -256,13 +256,17 @@ Keyboard controls (during capture):
     "--undo", is_flag=True, default=False,
     help="With --retag: revert the last retag on FOLDER.",
 )
+@click.option(
+    "--no-ai", "no_ai", is_flag=True, default=False,
+    help="With --retag: disable the local-AI disambiguation assist.",
+)
 @click.argument("folder", type=click.Path(path_type=Path), required=False)
 def main(process, device, output, artist, album, threshold, silence_duration,
-         sample_rate, retag_mode, undo, folder):
+         sample_rate, retag_mode, undo, no_ai, folder):
     # --- Retag mode: clean up an existing folder, then exit ---
     if retag_mode:
         from song_eater import retag
-        retag.run(folder or Path.cwd(), undo=undo)
+        retag.run(folder or Path.cwd(), undo=undo, use_ai=not no_ai)
         return
 
     if output is None:

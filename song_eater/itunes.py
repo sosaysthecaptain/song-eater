@@ -111,6 +111,45 @@ def _build_result(hit: dict, collection_id: int | None = None) -> dict:
     }
 
 
+def album_candidates(artist: str, album: str, limit: int = 6) -> list[dict]:
+    """Return iTunes album releases matching artist+album, each with its full
+    tracklist. Apple often models deluxe editions as ONE album (e.g. the whole
+    "GUTS (spilled)"), which MusicBrainz splits into album + bonus EP — so this
+    is the better source for such cases.
+    """
+    q = f"{artist} {album}".strip()
+    params = urllib.parse.urlencode(
+        {"term": q, "media": "music", "entity": "album", "limit": str(limit)})
+    data = _fetch_json(f"https://itunes.apple.com/search?{params}")
+    out: list[dict] = []
+    for al in (data or {}).get("results", []):
+        cid = al.get("collectionId")
+        if not cid:
+            continue
+        look = _fetch_json(f"https://itunes.apple.com/lookup?id={cid}&entity=song")
+        tracks = [it for it in (look or {}).get("results", [])
+                  if it.get("wrapperType") == "track" and it.get("trackName")]
+        if not tracks:
+            continue
+        tracklist = [
+            (int(t.get("discNumber") or 1), int(t.get("trackNumber") or 0), t["trackName"])
+            for t in tracks
+        ]
+        name = al.get("collectionName", "")
+        art_url = (al.get("artworkUrl100", "") or "").replace("100x100bb", "1200x1200bb")
+        out.append({
+            "collection_id": cid,
+            "album": name,
+            "album_artist": al.get("artistName", ""),
+            "year": (al.get("releaseDate", "") or "")[:4],
+            "tracklist": tracklist,
+            "artwork_url": art_url,
+            "is_comp": bool(re.search(
+                r"greatest hits|the best of|collection|essential|\blive\b|compilation", name, re.I)),
+        })
+    return out
+
+
 def _find_track_in_collection(collection_id: int, title: str) -> dict | None:
     """Look up all tracks in a collection and find one matching *title*."""
     lookup_url = (
