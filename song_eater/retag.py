@@ -277,10 +277,17 @@ def resolve_single(tf: TrackFile, album_hint: str | None = None) -> ReleaseMatch
     # mismatches like "TWICE – TT" ranking a soundtrack cover first.
     hint = album_hint or tf.tags["album"]
     if hint and norm(clean_album(hint)) not in ("", "unknown"):
-        for a in itunes.album_candidates(artist, clean_album(hint), limit=4):
+        file_artist = norm(tf.tags["artist"])
+        hits = []
+        for a in itunes.album_candidates(artist, clean_album(hint), limit=6):
             pos = next(((d, p, t) for d, p, t in a["tracklist"] if _sim(nt, norm(t)) >= 0.7), None)
-            if not pos:
-                continue
+            if pos:
+                hits.append((a, pos))
+        if hits:
+            # Prefer the release whose artist credit matches the file's — fixes
+            # remixes/collabs (e.g. a "Tame Impala & JENNIE" remix vs the plain
+            # "Tame Impala" single, which have different covers).
+            a, pos = max(hits, key=lambda ap: _sim(file_artist, norm(ap[0]["album_artist"])))
             art = None
             if a["artwork_url"]:
                 b = itunes._fetch_artwork(a["artwork_url"])
