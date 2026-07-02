@@ -5,7 +5,7 @@ import subprocess
 import urllib.request
 from pathlib import Path
 
-from mutagen.id3 import APIC, ID3, TALB, TCOM, TDRC, TIT2, TPE1, TPE2, TPOS, TRCK
+from mutagen.id3 import APIC, ID3, TALB, TCMP, TCOM, TDRC, TIT2, TPE1, TPE2, TPOS, TRCK
 
 
 def save_track(wav_path: str, metadata: dict, output_dir: Path) -> Path | None:
@@ -83,6 +83,11 @@ def retag(mp3_path: Path, updates: dict) -> None:
         tags.add(TDRC(encoding=3, text=updates["year"]))
     if "album_artist" in updates:
         tags.add(TPE2(encoding=3, text=updates["album_artist"]))
+    if "compilation" in updates:
+        if updates["compilation"]:
+            tags.add(TCMP(encoding=3, text="1"))   # iTunes "part of a compilation"
+        else:
+            tags.delall("TCMP")
     if "composer" in updates:
         tags.add(TCOM(encoding=3, text=updates["composer"]))
     if updates.get("artwork_data"):

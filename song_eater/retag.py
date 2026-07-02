@@ -57,6 +57,7 @@ class TrackFile:
     path: Path
     tags: dict           # current text values for _FRAMES keys
     art_len: int         # bytes of largest embedded cover, 0 if none
+    comp: bool = False   # iTunes "part of a compilation" (TCMP) already set
 
 
 def _read_str(id3: ID3, frame: str) -> str:
@@ -75,7 +76,8 @@ def scan_folder(folder: Path) -> list[TrackFile]:
             id3 = ID3()
         tags = {name: _read_str(id3, frame) for name, frame in _FRAMES.items()}
         art_len = max((len(id3[k].data) for k in id3.keys() if k.startswith("APIC")), default=0)
-        out.append(TrackFile(path=p, tags=tags, art_len=art_len))
+        comp = _read_str(id3, "TCMP") in ("1", "True")
+        out.append(TrackFile(path=p, tags=tags, art_len=art_len, comp=comp))
     return out
 
 
@@ -424,6 +426,28 @@ def _plan_file(tf: TrackFile, match: ReleaseMatch | None, pos: tuple | None,
     return plan
 
 
+def _enforce_album_consistency(match: ReleaseMatch, plans: list[FilePlan]) -> None:
+    """Guarantee an album never splits in a player: give every placed track ONE
+    album_artist, and set the compilation flag when the track artists differ.
+    """
+    placed = [p for p in plans if p.pos]
+    if not placed:
+        return
+    album_artist = match.album_artist
+    if not album_artist:
+        artists = {p.file.tags["artist"] for p in placed if p.file.tags["artist"]}
+        album_artist = artists.pop() if len(artists) == 1 else "Various Artists"
+    is_comp = len({norm(p.file.tags["artist"]) for p in placed if p.file.tags["artist"]}) > 1
+    for pl in placed:
+        cur = pl.file.tags.get("album_artist", "")
+        if cur != album_artist:
+            pl.changes["album_artist"] = (cur, album_artist)
+        else:
+            pl.changes.pop("album_artist", None)
+        if is_comp and not pl.file.comp:
+            pl.changes["compilation"] = ("", "1")
+
+
 def _verify_art(folder: Path, tf: TrackFile, match: ReleaseMatch | None) -> bool:
     """Decide whether to apply match.art to this file.
 
@@ -501,6 +525,10 @@ def _print_album_line(pl: FilePlan) -> None:
         detail.append(f"track {pl.changes['track'][0] or '—'}→{pl.changes['track'][1]}")
     if "album" in pl.changes:
         detail.append(f'→ "{pl.changes["album"][1]}"')
+    if "album_artist" in pl.changes:
+        detail.append("album-artist")
+    if "compilation" in pl.changes:
+        detail.append("compilation")
     if pl.art_change:
         detail.append("art↑")
     tail = f"   {click.style(', '.join(detail), fg='bright_black')}" if detail else ""
@@ -689,6 +717,10 @@ def run(folder: Path, undo: bool = False, assume_yes: bool = False,
             album_plans.append((group[0].match, group))
         else:
             loose_plans.extend(group)
+
+    # Keep every album together in players: one album_artist + compilation flag.
+    for match, plans in album_plans:
+        _enforce_album_consistency(match, plans)
 
     n_changed = print_report(album_plans, loose_plans)
     all_plans = [pl for _, plans in album_plans for pl in plans] + loose_plans
