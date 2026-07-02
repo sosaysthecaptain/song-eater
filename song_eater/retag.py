@@ -170,7 +170,7 @@ def resolve_album(files: list[TrackFile]) -> ReleaseMatch | None:
         year=mb.first_year(rg),
         mbid=rg["id"],
         tracklist=tracklist,
-        confidence="confident" if coverage >= 0.6 else "weak",
+        confidence="confident",  # refined by completeness in run()
     )
 
 
@@ -317,8 +317,10 @@ def print_report(album_plans: list[tuple[ReleaseMatch, list[FilePlan]]],
         head = f"{match.album_artist} — {match.album}"
         if match.year:
             head += f" ({match.year})"
+        partial = match.confidence.startswith("partial")
         click.echo(click.style(f"\n{head}", bold=True) +
-                   click.style(f"   [MusicBrainz · {match.confidence}]", fg="bright_black"))
+                   click.style(f"   [MusicBrainz · {match.confidence}]",
+                               fg="yellow" if partial else "bright_black"))
         if any(pl.art_change for pl in plans):
             click.echo("   " + click.style(f"art → {match.art[2] // 1024}KB", fg="green"))
         for pl in plans:
@@ -337,6 +339,11 @@ def print_report(album_plans: list[tuple[ReleaseMatch, list[FilePlan]]],
 def _print_file_line(pl: FilePlan) -> None:
     tf = pl.file
     title = tf.tags["title"] or tf.path.name
+    if pl.match and pl.pos is None:   # couldn't place in this edition
+        click.echo(click.style(f"    –   {title}", fg="yellow")
+                   + click.style("   couldn't place — bonus/deluxe edition? left as-is",
+                                 fg="bright_black"))
+        return
     if not pl.changes and not pl.art_change:
         click.echo(click.style(f"   ok   {title}", fg="bright_black"))
         return
@@ -465,7 +472,19 @@ def run(folder: Path, undo: bool = False, assume_yes: bool = False,
             continue
         fetch_art(match)
         posmap = assign_positions(files, match.tracklist)
-        plans = [_plan_file(f, match, posmap.get(f.path)) for f in files]
+        plans = []
+        for f in files:
+            pos = posmap.get(f.path)
+            if pos:
+                plans.append(_plan_file(f, match, pos))
+            else:
+                # This edition doesn't contain the track — leave it untouched
+                # and flag it, rather than half-tagging (album but no number).
+                plans.append(FilePlan(file=f, match=match, pos=None))
+        n_unplaced = sum(1 for p in plans if p.pos is None)
+        # Confidence = completeness. A partial match is NOT confident.
+        match.confidence = ("confident" if n_unplaced == 0
+                            else f"partial · {n_unplaced} unplaced")
         album_plans.append((match, plans))
 
     loose_plans: list[FilePlan] = []
