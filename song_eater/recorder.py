@@ -1,11 +1,13 @@
 """Audio capture and silence-based track splitting."""
 
 import os
+import queue
 import signal
 import subprocess
 import sys
+import threading
 import wave
-from collections.abc import Generator
+from collections.abc import Callable, Generator
 from pathlib import Path
 
 import numpy as np
@@ -13,6 +15,54 @@ import sounddevice as sd
 
 
 AUDIO_TAP_PATH = Path(__file__).parent / "audio_tap"
+
+# Sentinel marking end-of-stream in the background drain queue.
+_EOF = object()
+
+
+def _threaded_chunks(
+    read_fn: Callable[[int], bytes],
+    bytes_per_chunk: int,
+    transform: Callable[[bytes], np.ndarray],
+    max_queue: int,
+) -> Generator[np.ndarray, None, None]:
+    """Drain a byte source on a background thread so a slow consumer can't
+    back up the OS pipe.
+
+    This is the core fix for the mid-song audio drop: the macOS pipe from the
+    audio_tap helper only buffers ~0.15s, and when it fills the Swift tap's
+    blocking write stalls its ScreenCaptureKit callback — which then *drops*
+    audio. Previously the single main loop both drained the pipe and did slow
+    blocking work (ffmpeg export, `media-control` polls, Rich renders), so any
+    of those stalls lost audio. Here a dedicated thread does nothing but read
+    the pipe into a bounded in-memory queue; the consumer can stall for seconds
+    and audio simply backs up in RAM instead of the pipe.
+
+    ``read_fn(n)`` must return exactly *n* bytes or raise on end/error.
+    ``transform`` converts raw bytes to the yielded chunk.
+    """
+    q: queue.Queue = queue.Queue(maxsize=max_queue)
+    err: list[BaseException | None] = [None]
+
+    def _run() -> None:
+        try:
+            while True:
+                q.put(transform(read_fn(bytes_per_chunk)))
+        except BaseException as e:  # noqa: BLE001 -- propagated to consumer
+            err[0] = e
+        finally:
+            q.put(_EOF)
+
+    thread = threading.Thread(target=_run, daemon=True)
+    thread.start()
+
+    while True:
+        item = q.get()
+        if item is _EOF:
+            if err[0] is not None:
+                raise err[0]
+            return
+        yield item
 
 
 def _kill_stale_audio_taps() -> None:
@@ -75,7 +125,6 @@ def _read_chunks_from_process_tap(
     )
 
     # Parse stderr for SAMPLE_RATE/CHANNELS and forward the rest
-    import threading
     tap_sample_rate = [0]
     tap_channels = [0]
     ready_event = threading.Event()
@@ -108,32 +157,37 @@ def _read_chunks_from_process_tap(
     # float32 = 4 bytes per sample
     bytes_per_chunk = chunk_frames * tap_ch * 4
 
+    def _read(n: int) -> bytes:
+        data = proc.stdout.read(n)
+        if not data:
+            # Subprocess pipe closed — find out why
+            retcode = proc.poll()
+            stderr_thread.join(timeout=1)
+            detail = "\n".join(stderr_lines[-20:]) if stderr_lines else "no stderr output"
+            raise RuntimeError(
+                f"audio_tap stopped unexpectedly (exit code {retcode}):\n{detail}"
+            )
+        return data
+
+    def _transform(data: bytes) -> np.ndarray:
+        float_data = np.frombuffer(data, dtype=np.float32)
+        expected = chunk_frames * tap_ch
+        if len(float_data) < expected:
+            float_data = np.pad(float_data, (0, expected - len(float_data)))
+        float_data = float_data.reshape(-1, tap_ch)
+        # Trim or duplicate channels to match requested channel count
+        if tap_ch > channels:
+            float_data = float_data[:, :channels]
+        elif tap_ch < channels:
+            float_data = np.column_stack([float_data] * (channels // tap_ch + 1))[:, :channels]
+        return np.ascontiguousarray(float_data)
+
+    # Bound the queue at ~60s of audio: normal export/poll stalls (seconds)
+    # buffer freely, but a truly wedged consumer can't exhaust RAM.
+    max_queue = max(64, int(60 * tap_sr / chunk_frames))
+
     try:
-        while True:
-            data = proc.stdout.read(bytes_per_chunk)
-            if not data:
-                # Subprocess pipe closed — find out why
-                retcode = proc.poll()
-                stderr_thread.join(timeout=1)
-                detail = "\n".join(stderr_lines[-20:]) if stderr_lines else "no stderr output"
-                if retcode is not None and retcode != 0:
-                    raise RuntimeError(
-                        f"audio_tap died with exit code {retcode}:\n{detail}"
-                    )
-                raise RuntimeError(
-                    f"audio_tap stopped unexpectedly (exit code {retcode}):\n{detail}"
-                )
-            float_data = np.frombuffer(data, dtype=np.float32)
-            expected = chunk_frames * tap_ch
-            if len(float_data) < expected:
-                float_data = np.pad(float_data, (0, expected - len(float_data)))
-            float_data = float_data.reshape(-1, tap_ch)
-            # Trim or duplicate channels to match requested channel count
-            if tap_ch > channels:
-                float_data = float_data[:, :channels]
-            elif tap_ch < channels:
-                float_data = np.column_stack([float_data] * (channels // tap_ch + 1))[:, :channels]
-            yield float_data
+        yield from _threaded_chunks(_read, bytes_per_chunk, _transform, max_queue)
     finally:
         proc.terminate()
         proc.wait()

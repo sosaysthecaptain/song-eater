@@ -273,6 +273,12 @@ def main(process, device, output, artist, album, threshold, silence_duration, sa
         **reader_kwargs,
     )
 
+    # Poll Now Playing off the capture loop so a blocking `media-control`
+    # call can never stall pipe draining and drop audio.
+    np_poller: nowplaying.NowPlayingPoller | None = None
+    if has_nowplaying and not manual_mode:
+        np_poller = nowplaying.NowPlayingPoller(source_app=process).start()
+
     keys = _KeyReader()
     track_num = 0
     shazam_id: _ShazamIdentifier | None = None
@@ -533,14 +539,26 @@ def main(process, device, output, artist, album, threshold, silence_duration, sa
                 tmp_path = tmp.name
             recorder.write_wav(tmp_path, audio, sample_rate)
             mp3_path = export.save_track(tmp_path, metadata, output)
-            state.completed.append(display.CompletedTrack(
-                number=metadata.get("track", track_num),
-                artist=metadata.get("artist", "Unknown"),
-                title=metadata.get("title", "Unknown"),
-                filename=mp3_path.name,
-                album=metadata.get("album", ""),
-                itunes_matched=bool(metadata.get("_itunes_matched")),
-            ))
+            if mp3_path is None:
+                # Already have this song in the folder (playlist looped) — discard.
+                state.completed.append(display.CompletedTrack(
+                    number=metadata.get("track", track_num),
+                    artist=metadata.get("artist", "Unknown"),
+                    title=metadata.get("title", "Unknown"),
+                    filename="",
+                    discarded=True,
+                    discard_reason="duplicate",
+                ))
+                _log_failure(metadata, "duplicate")
+            else:
+                state.completed.append(display.CompletedTrack(
+                    number=metadata.get("track", track_num),
+                    artist=metadata.get("artist", "Unknown"),
+                    title=metadata.get("title", "Unknown"),
+                    filename=mp3_path.name,
+                    album=metadata.get("album", ""),
+                    itunes_matched=bool(metadata.get("_itunes_matched")),
+                ))
             state.scroll_pinned = True
         except Exception as e:
             state.error = f"Export failed: {e}"
@@ -594,7 +612,7 @@ def main(process, device, output, artist, album, threshold, silence_duration, sa
                         # Poll Now Playing (1s for title-change detection)
                         if has_nowplaying and not manual_mode and (now - np_last_poll) >= NP_POLL_INTERVAL:
                             np_last_poll = now
-                            np_result = nowplaying.get_now_playing(source_app=process)
+                            np_result = np_poller.latest() if np_poller else None
                             if np_result and np_result.get("title"):
                                 new_title = np_result.get("title")
 
@@ -735,7 +753,7 @@ def main(process, device, output, artist, album, threshold, silence_duration, sa
                     # Silence triggered a split — but is the same song still playing?
                     np_still_playing = False
                     if has_nowplaying and not manual_mode and np_current_title:
-                        np_check = nowplaying.get_now_playing(source_app=process)
+                        np_check = np_poller.latest() if np_poller else None
                         if np_check and np_check.get("title") == np_current_title:
                             np_still_playing = True
 
@@ -774,6 +792,8 @@ def main(process, device, output, artist, album, threshold, silence_duration, sa
         click.echo(f"Full traceback written to {crash_log}", err=True)
     finally:
         keys.stop()
+        if np_poller:
+            np_poller.stop()
 
     total = len(state.completed)
     click.echo(f"\nDone. Saved {total} track{'s' if total != 1 else ''}.")

@@ -5,6 +5,7 @@ from __future__ import annotations
 import base64
 import json
 import subprocess
+import threading
 
 
 def _poll() -> dict | None:
@@ -75,6 +76,44 @@ def get_now_playing(source_app: str | None = None) -> dict | None:
         "artwork_data": artwork_data,
         "artwork_mime": artwork_mime,
     }
+
+
+class NowPlayingPoller:
+    """Poll Now Playing on a background thread and cache the latest result.
+
+    The capture loop must never block on ``media-control`` — a synchronous poll
+    stalls the loop, backs up the audio pipe, and drops audio (see
+    ``recorder._threaded_chunks``). This runs the subprocess off the hot path;
+    the loop reads the cached value via :meth:`latest`, which never blocks.
+    """
+
+    def __init__(self, source_app: str | None = None, interval: float = 0.5):
+        self._source_app = source_app
+        self._interval = interval
+        self._latest: dict | None = None
+        self._lock = threading.Lock()
+        self._stop = threading.Event()
+        self._thread: threading.Thread | None = None
+
+    def start(self) -> "NowPlayingPoller":
+        self._thread = threading.Thread(target=self._run, daemon=True)
+        self._thread.start()
+        return self
+
+    def _run(self) -> None:
+        while not self._stop.is_set():
+            result = get_now_playing(source_app=self._source_app)
+            with self._lock:
+                self._latest = result
+            self._stop.wait(self._interval)
+
+    def latest(self) -> dict | None:
+        """Return the most recent poll result (non-blocking)."""
+        with self._lock:
+            return self._latest
+
+    def stop(self) -> None:
+        self._stop.set()
 
 
 def is_available() -> bool:
